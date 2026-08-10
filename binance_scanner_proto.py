@@ -615,6 +615,13 @@ def save_results_md(candidates: List[Dict], scan_started: datetime,
         "- **Quote pairs:** USDT / USDC",
         f"- **Win-rate window:** {MIN_WR*100:.2f}% – {MAX_WR*100:.2f}%",
         "- **Strategy:** RSI oversold bounce near 20-bar low",
+        f"- **TP / SL:** {TP_MULT}×ATR / {SL_MULT}×ATR  "
+        f"(SL trigger: SL + {TRIG_MULT}×ATR)",
+        f"- **RSI window:** {RSI_LOW}–{RSI_HIGH}"
+        f"   ·   Near {LO_LOOKBACK}-bar low × {LO_MARGIN}",
+        f"- **Min ATR:** {MIN_ATR_PCT*100:.2f}% of price",
+        f"- **Forward bars:** {FWD_BARS}   ·   **Cool-down:** {COOL_DOWN}",
+        f"- **Min signals:** {MIN_SIGNALS}",
         f"- **Interval:** {INTERVAL}",
         f"- **Candles per symbol:** {N_CANDLES}",
         f"- **Pairs scanned:** up to {MAX_SCAN}",

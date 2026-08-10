@@ -799,6 +799,20 @@ class TestMarkdownResults(unittest.TestCase):
         self.assertIn("| Entry | 100.0000 USDT |", text)
         self.assertIn("## Execution", text)
 
+    def test_md_records_full_parameter_set(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = proto.save_results_md([], datetime(2026, 1, 2, 3, 4, 5), td)
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        for line in (
+            f"- **TP / SL:** {proto.TP_MULT}\u00d7ATR / {proto.SL_MULT}\u00d7ATR",
+            f"- **RSI window:** {proto.RSI_LOW}\u2013{proto.RSI_HIGH}",
+            f"- **Min ATR:** {proto.MIN_ATR_PCT*100:.2f}% of price",
+            f"- **Forward bars:** {proto.FWD_BARS}",
+            f"- **Min signals:** {proto.MIN_SIGNALS}",
+        ):
+            self.assertIn(line, text)
+
 
 class TestDefaultLogPath(unittest.TestCase):
     """V1 - default log path is timestamped under the logs dir."""
