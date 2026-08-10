@@ -40,6 +40,21 @@ except ImportError as exc:
     sys.exit(1)
 
 
+def _setup_console() -> None:
+    """Force UTF-8 output with replacement fallback (Windows cp1252 safety)."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
+_setup_console()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ANSI palette
 # ══════════════════════════════════════════════════════════════════════════════
@@ -84,6 +99,8 @@ class Config:
 # ══════════════════════════════════════════════════════════════════════════════
 class Logger:
     def __init__(self, path: str = "") -> None:
+        if path:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._fh = open(path, "w", encoding="utf-8") if path else None
 
     def _ts(self) -> str:
@@ -234,6 +251,7 @@ CREATE TABLE IF NOT EXISTS pair_scans (
 """
 
 def db_open(path: str, log: Logger) -> sqlite3.Connection:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.executescript(_SCHEMA)
     conn.commit()
@@ -287,7 +305,6 @@ def db_insert_pair(conn: sqlite3.Connection, row: Dict[str, Any]) -> None:
 #  Binance REST helpers
 # ══════════════════════════════════════════════════════════════════════════════
 BASE_URL = "https://api.binance.com"
-_BLOCKED  = ("UP","DOWN","BULL","BEAR","3L","3S","2L","2S","5L","5S")
 
 
 def _get(url: str, params: Optional[Dict] = None, retries: int = 3) -> Optional[Any]:
@@ -333,7 +350,7 @@ def step_exchange(cfg: Config, log: Logger) -> List[Dict]:
 
     counts: Dict[str, int] = dict(
         NOT_TRADING=0, WRONG_QUOTE=0, NOT_SPOT=0,
-        LEVERAGED=0, HIGH_NOTIONAL=0, PASSED=0
+        HIGH_NOTIONAL=0, PASSED=0
     )
 
     pairs: List[Dict] = []
@@ -348,9 +365,6 @@ def step_exchange(cfg: Config, log: Logger) -> List[Dict]:
             continue
         if not s["isSpotTradingAllowed"]:
             counts["NOT_SPOT"] += 1
-            continue
-        if any(s["baseAsset"].endswith(x) for x in _BLOCKED):
-            counts["LEVERAGED"] += 1
             continue
 
         fmap    = {f["filterType"]: f for f in s["filters"]}
@@ -378,7 +392,6 @@ def step_exchange(cfg: Config, log: Logger) -> List[Dict]:
     log.info(f"  Status != TRADING            : {counts['NOT_TRADING']:>6,}")
     log.info(f"  Wrong quote (not USDT/USDC)  : {counts['WRONG_QUOTE']:>6,}")
     log.info(f"  Spot not allowed             : {counts['NOT_SPOT']:>6,}")
-    log.info(f"  Leveraged/inverse token      : {counts['LEVERAGED']:>6,}")
     log.info(f"  Min notional > ${cfg.budget:.2f}       : {counts['HIGH_NOTIONAL']:>6,}")
     log.ok(  f"  Eligible pairs               : {counts['PASSED']:>6,}")
 
@@ -398,8 +411,8 @@ def step_ticker(pairs: List[Dict], cfg: Config, log: Logger) -> List[Dict]:
 
     data = _get(f"{BASE_URL}/api/v3/ticker/24hr")
     if not data:
-        log.warn("Ticker fetch failed — proceeding without volume filter.")
-        return pairs
+        log.fail("Ticker fetch failed after retries — aborting scan.")
+        sys.exit(1)
 
     tmap = {t["symbol"]: t for t in data}
 
@@ -452,9 +465,10 @@ def step_ticker(pairs: List[Dict], cfg: Config, log: Logger) -> List[Dict]:
         out.append({**p, "price": price, "volume": vol, "chg24": chg})
 
     log.raw()
+    quote_label = pairs[0]["quote"] if pairs else "USDT"
     log.info(f"  No ticker data               : {counts['NO_TICKER']:>6,}")
     log.info(f"  Zero / invalid price         : {counts['ZERO_PRICE']:>6,}")
-    log.info(f"  Volume < {cfg.min_vol/1e3:,.0f}k {p['quote']:4}          : {counts['LOW_VOL']:>6,}")
+    log.info(f"  Volume < {cfg.min_vol/1e3:,.0f}k {quote_label:4}          : {counts['LOW_VOL']:>6,}")
     log.info(f"  Qty unaffordable             : {counts['UNAFFORDABLE']:>6,}")
     log.ok(  f"  Pass → queued for scan       : {counts['PASSED']:>6,}")
 

@@ -29,6 +29,21 @@ import numpy as np
 import pandas as pd
 import requests
 
+
+def _setup_console() -> None:
+    """Force UTF-8 output with replacement fallback (Windows cp1252 safety)."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
+_setup_console()
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 BASE_URL    = "https://api.binance.com"
 BUDGET      = 10.0        # USD
@@ -95,7 +110,6 @@ def get_pairs() -> List[Dict]:
     if not data:
         sys.exit("  [ERROR]  Cannot reach Binance API. Check your connection.")
 
-    blocked_suffixes = ("UP", "DOWN", "BULL", "BEAR", "3L", "3S", "2L", "2S")
     pairs: List[Dict] = []
 
     for s in data["symbols"]:
@@ -103,7 +117,6 @@ def get_pairs() -> List[Dict]:
             s["status"] != "TRADING"
             or s["quoteAsset"] not in ("USDT", "USDC")
             or not s["isSpotTradingAllowed"]
-            or any(s["baseAsset"].endswith(x) for x in blocked_suffixes)
         ):
             continue
 
@@ -134,8 +147,7 @@ def enrich_ticker(pairs: List[Dict]) -> List[Dict]:
     """Add 24 h price, volume, % change; apply volume + affordability filter."""
     data = GET(f"{BASE_URL}/api/v3/ticker/24hr")
     if not data:
-        print("  [WARN]  Could not fetch ticker — continuing without volume data.")
-        return pairs
+        sys.exit("  [ERROR]  Cannot fetch 24 h ticker data — aborting scan.")
 
     tmap = {t["symbol"]: t for t in data}
     out: List[Dict] = []
