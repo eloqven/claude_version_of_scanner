@@ -5,11 +5,16 @@ All Binance REST responses are mocked. Run with:
 """
 
 import io
+import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.request
 from decimal import Decimal
+from http.server import ThreadingHTTPServer
 from unittest import mock
 
 import pandas as pd
@@ -18,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import binance_scanner_proto as proto
 import binance_scanner_v1 as v1
+import log_dashboard as dash
 
 
 def _symbol(symbol, base, quote, status="TRADING", spot=True,
@@ -683,6 +689,86 @@ class TestDefaultLogPath(unittest.TestCase):
             self.assertTrue(os.path.basename(path).startswith("v1_"))
             self.assertRegex(os.path.basename(path),
                              r"^v1_\d{8}_\d{6}\.log$")
+
+
+class TestLogDashboard(unittest.TestCase):
+    """Log dashboard - file listing, paginated reads, HTTP API."""
+
+    def _dir_with_logs(self, td, n_lines=25):
+        path = os.path.join(td, "a_20260101_000000.log")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(f"line {i}" for i in range(n_lines)))
+        return path
+
+    def test_list_logs_filters_and_sorts(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._dir_with_logs(td)
+            with open(os.path.join(td, "b_20260102_000000.log"), "w") as fh:
+                fh.write("x")
+            with open(os.path.join(td, "notes.txt"), "w") as fh:
+                fh.write("not a log")
+            entries = dash.list_logs(td)
+        self.assertEqual([e["name"] for e in entries],
+                         ["b_20260102_000000.log", "a_20260101_000000.log"])
+        self.assertEqual(entries[0]["size"], 1)
+        self.assertIn("2026-", entries[0]["mtime"])
+
+    def test_list_logs_missing_dir(self):
+        self.assertEqual(dash.list_logs("C:\\no\\such\\dir\\xyz"), [])
+
+    def test_read_page_paginates(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._dir_with_logs(td)
+            p1 = dash.read_page(td, "a_20260101_000000.log", 1, 10)
+            p3 = dash.read_page(td, "a_20260101_000000.log", 3, 10)
+        self.assertEqual(p1["total"], 25)
+        self.assertEqual(p1["pages"], 3)
+        self.assertEqual(p1["lines"][0], "line 0")
+        self.assertEqual(p1["lines"][-1], "line 9")
+        self.assertEqual(p3["lines"], ["line 20", "line 21", "line 22",
+                                       "line 23", "line 24"])
+
+    def test_read_page_query_filters(self):
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "s.log"), "w", encoding="utf-8") as fh:
+                fh.write("ok line\nWARN something\nok again\n")
+            data = dash.read_page(td, "s.log", 1, 10, query="WARN")
+        self.assertEqual(data["total"], 1)
+        self.assertEqual(data["lines"], ["WARN something"])
+
+    def test_read_page_rejects_path_traversal(self):
+        with tempfile.TemporaryDirectory() as td:
+            for bad in ("..", "..\\x.log", "sub/x.log", "C:\\windows\\x.log",
+                        "../etc/passwd", ""):
+                self.assertIsNone(dash.read_page(td, bad), bad)
+
+    def test_http_api_end_to_end(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._dir_with_logs(td)
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), dash.make_handler(td))
+            httpd.daemon_threads = True
+            port = httpd.server_address[1]
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/api/logs") as r:
+                    data = json.load(r)
+                self.assertEqual(len(data["logs"]), 1)
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/api/log"
+                        f"?name=a_20260101_000000.log&page=3&page_size=10") as r:
+                    data = json.load(r)
+                self.assertEqual(data["total"], 25)
+                self.assertEqual(data["pages"], 3)
+                self.assertEqual(len(data["lines"]), 5)
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/api/log?name=..%2Fx.log")
+                self.assertEqual(ctx.exception.code, 404)
+            finally:
+                httpd.shutdown()
+                thread.join()
 
 
 if __name__ == "__main__":
