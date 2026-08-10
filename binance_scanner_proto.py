@@ -20,6 +20,7 @@ Run:
 ──────────────────────────────────────────────────────────────────────────────
 """
 
+import os
 import re
 import sys
 import time
@@ -31,6 +32,12 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import requests
+
+from scanner_common import (
+    exclusive_log_path as _exclusive_path,
+    load_percent_price_reference as _load_percent_price_reference,
+    parse_symbol_filters,
+)
 
 
 def _setup_console() -> None:
@@ -91,13 +98,19 @@ _LOG_PATH = ""
 
 
 def init_logfile(prefix: str = "proto", logdir: str = "logs") -> str:
-    """Tee stdout/stderr into a timestamped UTF-8 log file. Returns its path."""
+    """Tee stdout/stderr into a timestamped UTF-8 log file. Returns its path.
+
+    The file is created exclusively — if the timestamped name already exists
+    a _1, _2, … suffix is used instead of overwriting it.
+    """
     global _LOG_ACTIVE, _LOG_PATH
     if _LOG_ACTIVE:
         return _LOG_PATH
-    path = Path(logdir) / f"{prefix}_{datetime.now():%Y%m%d_%H%M%S}.log"
-    Path(logdir).mkdir(parents=True, exist_ok=True)
-    fh = open(path, "w", encoding="utf-8")
+    logdir = Path(logdir)
+    logdir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = _exclusive_path(logdir, prefix, stamp)
+    fh = open(path, "a", encoding="utf-8")
     sys.stdout = _Tee(sys.stdout, fh)
     sys.stderr = _Tee(sys.stderr, fh)
     _LOG_ACTIVE = True
@@ -208,6 +221,11 @@ def GET(url: str, params: Optional[Dict] = None, retries: int = 3) -> Optional[a
 
 # ── Exchange helpers ───────────────────────────────────────────────────────────
 
+def load_percent_price_reference(p: Dict) -> bool:
+    """Load the reference required to validate percent-price limits."""
+    return _load_percent_price_reference(p, GET, BASE_URL)
+
+
 def exchange_filter_counts(data: List[Dict],
                            log: Optional[_Log] = None) -> Tuple[List[Dict], Dict[str, int]]:
     """Apply the eligibility filters, counting per-reason rejections.
@@ -216,7 +234,7 @@ def exchange_filter_counts(data: List[Dict],
     """
     counts: Dict[str, int] = dict(
         NOT_TRADING=0, WRONG_QUOTE=0, NOT_SPOT=0,
-        HIGH_NOTIONAL=0, PASSED=0
+        HIGH_NOTIONAL=0, BAD_FILTERS=0, PASSED=0
     )
     pairs: List[Dict] = []
 
@@ -233,30 +251,27 @@ def exchange_filter_counts(data: List[Dict],
             counts["NOT_SPOT"] += 1
             continue
 
-        fmap = {f["filterType"]: f for f in s["filters"]}
+        filters = parse_symbol_filters(s)
+        if filters is None:
+            counts["BAD_FILTERS"] += 1
+            if log:
+                log.skip(f"{sym:<18} BAD_FILTERS      "
+                         f"— missing/invalid PRICE_FILTER, LOT_SIZE or NOTIONAL")
+            continue
 
-        # min notional — Binance uses "NOTIONAL" in newer response, "MIN_NOTIONAL" in older
-        nf      = fmap.get("NOTIONAL") or fmap.get("MIN_NOTIONAL") or {}
-        min_val = Decimal(nf.get("minNotional", "1.0"))
-        if min_val > Decimal(str(BUDGET)):
+        if filters["min_val"] > Decimal(str(BUDGET)):
             counts["HIGH_NOTIONAL"] += 1
             if log:
                 log.skip(f"{sym:<18} HIGH_MIN_NOTIONAL  "
-                         f"minNotional={min_val:.2f} > budget={BUDGET:.2f}")
+                         f"minNotional={filters['min_val']:.2f} > budget={BUDGET:.2f}")
             continue
-
-        lot_f  = fmap.get("LOT_SIZE", {})
-        tick_f = fmap.get("PRICE_FILTER", {})
 
         counts["PASSED"] += 1
         pairs.append(dict(
-            symbol  = s["symbol"],
-            base    = s["baseAsset"],
-            quote   = s["quoteAsset"],
-            min_val = min_val,
-            min_qty = Decimal(lot_f.get("minQty", "0")),
-            step    = Decimal(lot_f.get("stepSize",  "0.01")),
-            tick    = Decimal(tick_f.get("tickSize", "0.0001")),
+            symbol = s["symbol"],
+            base   = s["baseAsset"],
+            quote  = s["quoteAsset"],
+            **filters,
         ))
 
     return pairs, counts
@@ -421,14 +436,15 @@ def _resolve_dual_hit(symbol: str, interval: str,
             return "win"
         if hit_sl and not hit_tp:
             return "loss"
-        if child == "1s":
-            return "loss"
-        c_open = int(df["ts"].iloc[k])
-        if k + 1 < len(df):
-            c_close = int(df["ts"].iloc[k + 1])
-        else:
-            c_close = c_open + _INTERVAL_MS.get(child, 0)
-        return _resolve_dual_hit(symbol, child, c_open, c_close, tp_p, sl_p)
+        if hit_tp and hit_sl:
+            if child == "1s":
+                return "loss"
+            c_open = int(df["ts"].iloc[k])
+            if k + 1 < len(df):
+                c_close = int(df["ts"].iloc[k + 1])
+            else:
+                c_close = c_open + _INTERVAL_MS.get(child, 0)
+            return _resolve_dual_hit(symbol, child, c_open, c_close, tp_p, sl_p)
     return "loss"
 
 
@@ -568,20 +584,70 @@ def build_order(price: float, atr: float, p: Dict) -> Optional[Dict]:
     """
     pr = Decimal(str(price))
     av = Decimal(str(atr))
+    if not pr.is_finite() or not av.is_finite() or pr <= 0 or av <= 0:
+        return None
 
     qty  = _floor_step(Decimal(str(BUDGET)) / pr, p["step"])
-    tp   = _ceil_tick(pr + av * Decimal(str(TP_MULT)),  p["tick"])
-    sl   = _floor_step(pr - av * Decimal(str(SL_MULT)), p["tick"])
-    trig = _ceil_tick(sl + av * Decimal(str(TRIG_MULT)), p["tick"])
+    tick = p["tick"]
+    tp_raw = pr + av * Decimal(str(TP_MULT))
+    sl_raw = pr - av * Decimal(str(SL_MULT))
+    tp = _ceil_tick(tp_raw, tick) if tick is not None else tp_raw
+    sl = _floor_step(sl_raw, tick) if tick is not None else sl_raw
+    trig_raw = sl + av * Decimal(str(TRIG_MULT))
+    trig = _ceil_tick(trig_raw, tick) if tick is not None else trig_raw
 
-    if qty <= 0:
+    # quantity: step alignment + min/max bounds
+    if qty <= 0 or qty % p["step"] != 0:
         return None
-    if p["min_qty"] > 0 and qty < p["min_qty"]:
-        return None
-    if qty * pr < p["min_val"]:
+    if qty < p["min_qty"] or qty > p["max_qty"]:
         return None
     if qty * pr > Decimal(str(BUDGET)):
         return None
+    market_min = p.get("market_min_qty")
+    market_max = p.get("market_max_qty")
+    market_step = p.get("market_step")
+    if market_min is not None and qty < market_min:
+        return None
+    if market_max is not None and qty > market_max:
+        return None
+    if market_step is not None and qty % market_step != 0:
+        return None
+
+    # every OCO leg: tick alignment + min/max price bounds
+    for leg in (pr, tp, trig, sl):
+        if not leg.is_finite() or leg <= 0:
+            return None
+        if tick is not None and leg % tick != 0:
+            return None
+        if p["min_price"] is not None and leg < p["min_price"]:
+            return None
+        if p["max_price"] is not None and leg > p["max_price"]:
+            return None
+
+    percent_min = p.get("percent_min_mult")
+    if percent_min is not None:
+        reference = p.get("percent_ref")
+        if (not isinstance(reference, Decimal) or not reference.is_finite()
+                or reference <= 0):
+            return None
+        percent_low = reference * percent_min
+        percent_high = reference * p["percent_max_mult"]
+        if any(leg < percent_low or leg > percent_high
+               for leg in (tp, trig, sl)):
+            return None
+        buy_low = reference * p["percent_buy_min_mult"]
+        buy_high = reference * p["percent_buy_max_mult"]
+        if pr < buy_low or pr > buy_high:
+            return None
+
+    # entry, TP and stop-limit legs must satisfy notional bounds
+    for leg in (pr, tp, sl):
+        notional = qty * leg
+        if notional < p["min_val"]:
+            return None
+        if p["max_val"] is not None and notional > p["max_val"]:
+            return None
+
     if not (tp > pr > trig > sl):
         return None
 
@@ -690,7 +756,7 @@ def save_results_md(candidates: List[Dict], scan_started: datetime,
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    log_path = init_logfile()
+    log_path = init_logfile(logdir=os.environ.get("SCANNER_LOGDIR", "logs"))
     scan_started = datetime.now()
 
     log.header([
@@ -728,6 +794,7 @@ def main() -> None:
     log.info(f"  Status != TRADING            : {counts['NOT_TRADING']:>6,}")
     log.info(f"  Wrong quote (not USDT/USDC)  : {counts['WRONG_QUOTE']:>6,}")
     log.info(f"  Spot not allowed             : {counts['NOT_SPOT']:>6,}")
+    log.info(f"  Bad/incomplete filters       : {counts['BAD_FILTERS']:>6,}")
     log.info(f"  Min notional > ${BUDGET:.2f}       : {counts['HIGH_NOTIONAL']:>6,}")
     log.ok(  f"  Eligible pairs               : {counts['PASSED']:>6,}")
 
@@ -858,6 +925,13 @@ def main() -> None:
                      f"{RED}REJECTED{RST}  ·  WR_TOO_HIGH  "
                      f"{DIM}{wr*100:.2f}% > {MAX_WR*100:.2f}%  "
                      f"({total_sigs} signals){RST}")
+            time.sleep(0.08)
+            continue
+
+        if not load_percent_price_reference(p):
+            log.tree(True, "VERDICT",
+                     f"{RED}REJECTED{RST}  ·  PRICE_REFERENCE_FAIL  "
+                     f"{DIM}cannot validate Binance percent-price limits{RST}")
             time.sleep(0.08)
             continue
 

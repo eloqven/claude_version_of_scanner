@@ -6,11 +6,11 @@ Requires `requests`, `numpy`, `pandas` (stdlib only otherwise). No API keys need
 ## Tests
 
 ```powershell
-python -m py_compile binance_scanner_v1.py binance_scanner_proto.py log_dashboard.py
+python -m py_compile scanner_common.py binance_scanner_v1.py binance_scanner_proto.py log_dashboard.py
 python -m unittest discover -s tests
 ```
 
-All 61 tests are deterministic and mocked — no network access.
+All tests are deterministic and mocked — no network access.
 
 ## V1 scanner — `binance_scanner_v1.py`
 
@@ -85,18 +85,42 @@ in the project root (gitignored) — including when zero candidates are found.
 python log_dashboard.py                          # http://127.0.0.1:8666
 python log_dashboard.py --port 9000              # custom port
 python log_dashboard.py --logdir logs            # custom log directory
-python log_dashboard.py --host 0.0.0.0 --port 9000   # expose on LAN
 ```
 
-Binds to `127.0.0.1:8666` by default. Open the printed URL in a browser:
-left panel lists log files (newest first), click one to browse its lines in a
-paginated, searchable table.
+Binds to `127.0.0.1:8666` by default (loopback only — the dashboard is
+never exposed to the LAN). Open the printed URL in a browser:
+the **Logs** tab lists log files (newest first) — click one to browse its
+lines in a paginated, searchable table.
+
+### Notebook tab
+
+The **Notebook** tab is a lightweight Jupyter-style panel: type a command in
+the input box, press `Enter`, and the output streams into a cell below
+(↑/↓ recall history). One job runs at a time; a busy job replies `409` with
+its `job_id` so you can attach to the running output.
+
+**Colour coding:** log lines use restrained semantic accents instead of
+painting the entire row. The palette selector switches between two distinct
+schemes: **Classic** graphite and **Ocean** deep teal. The choice persists
+across reloads and applies to both tabs.
+
+| Command | What it does |
+|---|---|
+| `/help` | Renders `help.md` (this file) as formatted markdown |
+| `/status` | DB size, log count, current running job |
+| `/logs` | Table of recent log files |
+| `/scan [args]` | Runs `binance_scanner_v1.py` with the given args (e.g. `/scan --max-scan 3`); no args = full scan |
+| `/proto` | Runs `binance_scanner_proto.py` |
+| `/history` | Prints past runs from the DB |
+| `/clear` | Clears the notebook transcript |
 
 | Endpoint | Description |
 |---|---|
 | `GET /` | Dashboard HTML page |
 | `GET /api/logs` | JSON list of log files (name, size, mtime) |
 | `GET /api/log?name=X&page=N&page_size=M&q=text` | Paginated lines, optional text filter (page_size ≤ 2000) |
+| `POST /api/run` | Run a notebook command: `{"command": "/scan --max-scan 3"}` |
+| `GET /api/run?job=ID&after=N` | Poll a running job — new lines since `after`, plus `running`/`finished`/`exit_code` |
 
 ## Logs
 
