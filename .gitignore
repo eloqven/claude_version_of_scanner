@@ -3,5 +3,8 @@
 *.db
 logs/
 binance_scan_*.md
+docs.html
+results_table_plan.md
+review_fixes_plan.md
 
 

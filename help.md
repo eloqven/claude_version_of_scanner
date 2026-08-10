@@ -1,6 +1,6 @@
 # Binance Scanner — Command Reference
 
-Run everything from the project root (`D:\claude_version_of_scanner`) with Python 3.11+.
+Run everything from the cloned project root with Python 3.11+.
 Requires `requests`, `numpy`, `pandas` (stdlib only otherwise). No API keys needed — public market data only.
 
 ## Tests
