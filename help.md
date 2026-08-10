@@ -113,5 +113,5 @@ paginated, searchable table.
 
 ---
 
-*Maintained with [Scout](scout), the local assistant. Commits are signed-off to
+*Maintained with Scout, the local assistant. Commits are signed-off to
 trace changes back to the session that made them.*
