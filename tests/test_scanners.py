@@ -13,6 +13,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from datetime import datetime
 from decimal import Decimal
 from http.server import ThreadingHTTPServer
 from unittest import mock
@@ -678,6 +679,125 @@ class TestLogfileTee(unittest.TestCase):
         self.assertRegex(text, r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]")
         self.assertIn("hello log", text)
         self.assertIn("line two", text)
+
+
+class TestVerboseLogging(unittest.TestCase):
+    """Proto - verbose logger style: embedded timestamps kept, ANSI stripped."""
+
+    def test_tee_keeps_embedded_timestamp_no_double_prefix(self):
+        real_out = sys.stdout
+        with tempfile.TemporaryDirectory() as td:
+            path = proto.init_logfile(prefix="proto", logdir=td)
+            tee = sys.stdout
+            try:
+                print("[23:15:28] INFO  some message")
+                print("plain line")
+                sys.stdout.flush()
+            finally:
+                sys.stdout = real_out
+                proto._LOG_ACTIVE = False
+                tee._fh.close()
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        self.assertIn("[23:15:28] INFO  some message", text)
+        self.assertNotIn("] [23:15:28]", text)
+        self.assertRegex(text, r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] plain")
+
+    def test_tee_strips_ansi_codes(self):
+        real_out = sys.stdout
+        with tempfile.TemporaryDirectory() as td:
+            path = proto.init_logfile(prefix="proto", logdir=td)
+            tee = sys.stdout
+            try:
+                proto.log.ok("message")
+                sys.stdout.flush()
+            finally:
+                sys.stdout = real_out
+                proto._LOG_ACTIVE = False
+                tee._fh.close()
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        self.assertNotIn("\033", text)
+        self.assertIn("PASS  message", text)
+
+
+class TestFilterCounts(unittest.TestCase):
+    """Proto - verbose filter helpers count per-reason rejections."""
+
+    def test_exchange_counts_reasons(self):
+        info = {"symbols": [
+            _symbol("BTCUSDT", "BTC", "USDT"),
+            _symbol("PAUSEDUSDT", "PAUSED", "USDT", status="BREAK"),
+            _symbol("EURUSDT", "EUR", "EUR"),
+            _symbol("UPUSDT", "UP", "USDT", spot=False),
+            _symbol("BIGUSDT", "BIG", "USDT", min_notional="50"),
+        ]}
+        pairs, counts = proto.exchange_filter_counts(info)
+        self.assertEqual(counts["NOT_TRADING"], 1)
+        self.assertEqual(counts["WRONG_QUOTE"], 1)
+        self.assertEqual(counts["NOT_SPOT"], 1)
+        self.assertEqual(counts["HIGH_NOTIONAL"], 1)
+        self.assertEqual(counts["PASSED"], 1)
+        self.assertEqual([p["symbol"] for p in pairs], ["BTCUSDT"])
+
+    def test_ticker_counts_reasons(self):
+        pairs = [
+            _symbol("GOODUSDT", "GOOD", "USDT"),
+            _symbol("GONEUSDT", "GONE", "USDT"),
+            _symbol("ZEROUSDT", "ZERO", "USDT"),
+            _symbol("LOWUSDT", "LOW", "USDT"),
+            _symbol("BIGUSDT", "BIG", "USDT"),
+        ]
+        tickers = [
+            _ticker("GOODUSDT"),
+            _ticker("ZEROUSDT", price="0.0"),
+            _ticker("LOWUSDT", vol="10"),
+            _ticker("BIGUSDT", price="100000000"),
+        ]
+        with mock.patch.object(proto, "GET", return_value=tickers):
+            out, counts = proto.ticker_filter_counts(pairs)
+        self.assertEqual(counts["NO_TICKER"], 1)
+        self.assertEqual(counts["ZERO_PRICE"], 1)
+        self.assertEqual(counts["LOW_VOL"], 1)
+        self.assertEqual(counts["UNAFFORDABLE"], 1)
+        self.assertEqual(counts["PASSED"], 1)
+        self.assertEqual([p["symbol"] for p in out], ["GOODUSDT"])
+
+    def test_backtest_detail_counts_flat_skips(self):
+        df = _fixture_df(n_bars=120)
+        with mock.patch.object(proto, "MIN_ATR_PCT", 100.0):
+            wins, losses, total, flat_skips = proto._backtest_detail(
+                df, proto.calc_atr(df), "TESTUSDT")
+        self.assertEqual((wins, losses, total), (0, 0, 0))
+        self.assertGreater(flat_skips, 0)
+
+
+class TestMarkdownResults(unittest.TestCase):
+    """Proto - save_results_md writes a timestamped markdown file."""
+
+    def test_md_empty_candidates(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = proto.save_results_md([], datetime(2026, 1, 2, 3, 4, 5), td)
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        self.assertTrue(path.endswith("binance_scan_20260102_030405.md"))
+        self.assertIn("No pairs matched", text)
+
+    def test_md_with_candidate(self):
+        cand = {
+            "symbol": "ABCUSDT", "base": "ABC", "quote": "USDT",
+            "price": 100.0, "volume": 5e6, "chg24": 1.5,
+            "atr": 2.0, "wr": 0.12, "sigs": 15,
+            "tp": 116.0, "sl": 98.0, "trig": 98.3,
+            "qty": 0.1, "gain": 1.6, "loss": -0.2, "rr": 8.0,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            path = proto.save_results_md([cand], datetime(2026, 1, 2, 3, 4, 5), td)
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        self.assertIn("### 1. ABCUSDT (USDT pair)", text)
+        self.assertIn("| Entry | 100.0000 USDT |", text)
+        self.assertIn("## Execution", text)
 
 
 class TestDefaultLogPath(unittest.TestCase):

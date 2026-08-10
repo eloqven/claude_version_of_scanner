@@ -20,6 +20,7 @@ Run:
 ──────────────────────────────────────────────────────────────────────────────
 """
 
+import re
 import sys
 import time
 from datetime import datetime
@@ -47,6 +48,13 @@ def _setup_console() -> None:
 _setup_console()
 
 
+# ── ANSI palette ──────────────────────────────────────────────────────────────
+
+GRN = "\033[92m";  RED = "\033[91m";  YLW = "\033[93m"
+CYN = "\033[96m";  DIM = "\033[2m";   BLD = "\033[1m";  RST = "\033[0m"
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
 # ── File logging ──────────────────────────────────────────────────────────────
 
 class _Tee:
@@ -59,12 +67,15 @@ class _Tee:
 
     def write(self, text: str) -> int:
         self._target.write(text)
-        if self._line_start and text:
-            self._fh.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] ")
-            self._line_start = False
-        self._fh.write(text.replace("\r", "\n"))
+        clean = _ANSI_RE.sub("", text).replace("\r", "\n")
+        for i, chunk in enumerate(clean.split("\n")):
+            if i > 0:
+                self._fh.write("\n")
+            if self._line_start and chunk and not chunk.startswith("["):
+                self._fh.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] ")
+            self._fh.write(chunk)
+            self._line_start = True
         self._fh.flush()
-        self._line_start = text.endswith("\n")
         return len(text)
 
     def flush(self) -> None:
@@ -92,6 +103,50 @@ def init_logfile(prefix: str = "proto", logdir: str = "logs") -> str:
     _LOG_ACTIVE = True
     _LOG_PATH = str(path)
     return _LOG_PATH
+
+
+# ── Verbose console logger ─────────────────────────────────────────────────────
+
+class _Log:
+    """Colored console logger — mirrors the V1 verbose output style."""
+
+    @staticmethod
+    def _ts() -> str:
+        return datetime.now().strftime("%H:%M:%S")
+
+    def raw(self, s: str = "")  -> None: print(s)
+    def info(self, msg: str)    -> None: print(f"{DIM}[{self._ts()}] INFO{RST}  {msg}")
+    def ok(self, msg: str)      -> None: print(f"{GRN}[{self._ts()}] PASS{RST}  {msg}")
+    def skip(self, msg: str)    -> None: print(f"{YLW}[{self._ts()}] SKIP{RST}  {msg}")
+    def fail(self, msg: str)    -> None: print(f"{RED}[{self._ts()}] FAIL{RST}  {msg}")
+
+    def section(self, title: str) -> None:
+        bar = "─" * 70
+        print(f"\n{CYN}{BLD}{bar}{RST}")
+        print(f"{CYN}{BLD}  {title}{RST}")
+        print(f"{CYN}{BLD}{bar}{RST}")
+
+    def header(self, rows: List[str]) -> None:
+        bar = "═" * 70
+        print(f"\n{BLD}{bar}{RST}")
+        for r in rows:
+            print(f"  {r}")
+        print(f"{BLD}{bar}{RST}")
+
+    def pair_start(self, idx: int, total: int, sym: str,
+                   price: str, vol: float, q: str) -> None:
+        print(f"\n{BLD}[{self._ts()}] PAIR [{idx:>3}/{total}] "
+              f"{CYN}{sym:<16}{RST}{BLD} price={price} vol={vol:,.0f} {q}{RST}")
+
+    def tree(self, last: bool, label: str, val: str, st: str = "") -> None:
+        pfx   = "└─" if last else "├─"
+        badge = {"ok": f" {GRN}✓{RST}", "fail": f" {RED}✗{RST}",
+                 "warn": f" {YLW}!{RST}"}.get(st, "")
+        print(f"               {pfx} {BLD}{label:<16}{RST}{val}{badge}")
+
+
+log = _Log()
+
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 BASE_URL    = "https://api.binance.com"
@@ -153,20 +208,29 @@ def GET(url: str, params: Optional[Dict] = None, retries: int = 3) -> Optional[a
 
 # ── Exchange helpers ───────────────────────────────────────────────────────────
 
-def get_pairs() -> List[Dict]:
-    """Fetch exchange info and return eligible USDT / USDC spot pairs."""
-    data = GET(f"{BASE_URL}/api/v3/exchangeInfo")
-    if not data:
-        sys.exit("  [ERROR]  Cannot reach Binance API. Check your connection.")
+def exchange_filter_counts(data: List[Dict],
+                           log: Optional[_Log] = None) -> Tuple[List[Dict], Dict[str, int]]:
+    """Apply the eligibility filters, counting per-reason rejections.
 
+    Returns (eligible pairs, counts dict). get_pairs() delegates here.
+    """
+    counts: Dict[str, int] = dict(
+        NOT_TRADING=0, WRONG_QUOTE=0, NOT_SPOT=0,
+        HIGH_NOTIONAL=0, PASSED=0
+    )
     pairs: List[Dict] = []
 
     for s in data["symbols"]:
-        if (
-            s["status"] != "TRADING"
-            or s["quoteAsset"] not in ("USDT", "USDC")
-            or not s["isSpotTradingAllowed"]
-        ):
+        sym = s["symbol"]
+
+        if s["status"] != "TRADING":
+            counts["NOT_TRADING"] += 1
+            continue
+        if s["quoteAsset"] not in ("USDT", "USDC"):
+            counts["WRONG_QUOTE"] += 1
+            continue
+        if not s["isSpotTradingAllowed"]:
+            counts["NOT_SPOT"] += 1
             continue
 
         fmap = {f["filterType"]: f for f in s["filters"]}
@@ -175,11 +239,16 @@ def get_pairs() -> List[Dict]:
         nf      = fmap.get("NOTIONAL") or fmap.get("MIN_NOTIONAL") or {}
         min_val = Decimal(nf.get("minNotional", "1.0"))
         if min_val > Decimal(str(BUDGET)):
+            counts["HIGH_NOTIONAL"] += 1
+            if log:
+                log.skip(f"{sym:<18} HIGH_MIN_NOTIONAL  "
+                         f"minNotional={min_val:.2f} > budget={BUDGET:.2f}")
             continue
 
         lot_f  = fmap.get("LOT_SIZE", {})
         tick_f = fmap.get("PRICE_FILTER", {})
 
+        counts["PASSED"] += 1
         pairs.append(dict(
             symbol  = s["symbol"],
             base    = s["baseAsset"],
@@ -190,28 +259,74 @@ def get_pairs() -> List[Dict]:
             tick    = Decimal(tick_f.get("tickSize", "0.0001")),
         ))
 
+    return pairs, counts
+
+
+def get_pairs() -> List[Dict]:
+    """Fetch exchange info and return eligible USDT / USDC spot pairs."""
+    data = GET(f"{BASE_URL}/api/v3/exchangeInfo")
+    if not data:
+        sys.exit("  [ERROR]  Cannot reach Binance API. Check your connection.")
+    pairs, _ = exchange_filter_counts(data)
     return pairs
 
 
-def enrich_ticker(pairs: List[Dict]) -> List[Dict]:
-    """Add 24 h price, volume, % change; apply volume + affordability filter."""
+def ticker_filter_counts(pairs: List[Dict],
+                         log: Optional[_Log] = None) -> Tuple[List[Dict], Dict[str, int]]:
+    """Add 24 h price, volume, % change; apply volume + affordability filter.
+
+    Counts each rejection reason. Returns (passing pairs, counts dict) —
+    enrich_ticker() delegates here with identical acceptance criteria.
+    """
     data = GET(f"{BASE_URL}/api/v3/ticker/24hr")
     if not data:
         sys.exit("  [ERROR]  Cannot fetch 24 h ticker data — aborting scan.")
 
     tmap = {t["symbol"]: t for t in data}
+    counts: Dict[str, int] = dict(
+        NO_TICKER=0, ZERO_PRICE=0, LOW_VOL=0,
+        UNAFFORDABLE=0, PASSED=0
+    )
     out: List[Dict] = []
 
     for p in pairs:
-        t = tmap.get(p["symbol"])
+        sym = p["symbol"]
+        t   = tmap.get(sym)
+
         if not t:
+            counts["NO_TICKER"] += 1
+            if log:
+                log.skip(f"{sym:<18} NO_TICKER       — symbol absent from 24 h ticker")
             continue
+
         price = float(t["lastPrice"])
         vol   = float(t["quoteVolume"])
-        if price <= 0 or vol < MIN_VOL:
+
+        if price <= 0:
+            counts["ZERO_PRICE"] += 1
+            if log:
+                log.skip(f"{sym:<18} ZERO_PRICE      — lastPrice={price}")
             continue
+
+        if vol < MIN_VOL:
+            counts["LOW_VOL"] += 1
+            if log:
+                log.skip(f"{sym:<18} LOW_VOLUME      — "
+                         f"vol={vol:>14,.0f}  (need ≥ {MIN_VOL:,.0f} {p['quote']})")
+            continue
+
         if BUDGET / price < 1e-6:       # can't buy a meaningful quantity
+            counts["UNAFFORDABLE"] += 1
+            if log:
+                log.skip(f"{sym:<18} UNAFFORDABLE    — "
+                         f"price={fmt(price)}  budget/price={BUDGET/price:.2e}")
             continue
+
+        counts["PASSED"] += 1
+        if log:
+            log.ok(f"{sym:<18} PASS            — "
+                   f"price={fmt(price):>12}  vol={vol:>16,.0f}  "
+                   f"chg={float(t['priceChangePercent']):>+7.2f}%")
         out.append({
             **p,
             "price"  : price,
@@ -219,6 +334,12 @@ def enrich_ticker(pairs: List[Dict]) -> List[Dict]:
             "chg24"  : float(t["priceChangePercent"]),
         })
 
+    return out, counts
+
+
+def enrich_ticker(pairs: List[Dict]) -> List[Dict]:
+    """Add 24 h price, volume, % change; apply volume + affordability filter."""
+    out, _ = ticker_filter_counts(pairs)
     return out
 
 
@@ -311,17 +432,18 @@ def _resolve_dual_hit(symbol: str, interval: str,
     return "loss"
 
 
-def backtest(df: pd.DataFrame, atr_s: pd.Series, symbol: str) -> Tuple[Optional[float], int]:
+def _backtest_detail(df: pd.DataFrame, atr_s: pd.Series,
+                     symbol: str) -> Tuple[int, int, int, int]:
     """
     Signal: RSI oversold (20–36) AND close ≤ 20-bar low × 1.025
     TP:     entry + ATR × TP_MULT      (8 ATR above)
     SL:     entry − ATR × SL_MULT      (1 ATR below)
     Outcome checked over the next FWD_BARS candles.
 
-    Returns (win_rate, n_signals) or (None, 0) if too few signals.
+    Returns (wins, losses, total_signals, flat_candle_skips).
     """
     rsi_s  = calc_rsi(df["close"])
-    wins   = losses = 0
+    wins   = losses = flat_skips = 0
     last_i = -(COOL_DOWN + 1)
     start  = max(LO_LOOKBACK + 14 + 1, 30)
 
@@ -336,6 +458,7 @@ def backtest(df: pd.DataFrame, atr_s: pd.Series, symbol: str) -> Tuple[Optional[
 
         pr = df["close"].iloc[i]
         if av / pr < MIN_ATR_PCT:       # coin is too flat
+            flat_skips += 1
             continue
 
         lo20 = df["low"].iloc[i - LO_LOOKBACK: i].min()
@@ -371,7 +494,19 @@ def backtest(df: pd.DataFrame, atr_s: pd.Series, symbol: str) -> Tuple[Optional[
                 last_i  = i
                 break
 
-    total = wins + losses
+    return wins, losses, wins + losses, flat_skips
+
+
+def backtest(df: pd.DataFrame, atr_s: pd.Series, symbol: str) -> Tuple[Optional[float], int]:
+    """
+    Signal: RSI oversold (20–36) AND close ≤ 20-bar low × 1.025
+    TP:     entry + ATR × TP_MULT      (8 ATR above)
+    SL:     entry − ATR × SL_MULT      (1 ATR below)
+    Outcome checked over the next FWD_BARS candles.
+
+    Returns (win_rate, n_signals) or (None, 0) if too few signals.
+    """
+    wins, losses, total, _ = _backtest_detail(df, atr_s, symbol)
     if total < MIN_SIGNALS:
         return None, 0
     return wins / total, total
@@ -390,6 +525,15 @@ def fmt(v: float) -> str:
 
 def pct(a: float, ref: float) -> float:
     return (a - ref) / ref * 100
+
+
+def _interval_hours(interval: str) -> float:
+    """Approximate hours per candle for a given interval string."""
+    mul = {"m": 1/60, "h": 1, "d": 24, "w": 168, "M": 720}
+    try:
+        return float(interval[:-1]) * mul.get(interval[-1], 1)
+    except Exception:
+        return 1.0
 
 
 def bar(n: int, total: int, width: int = 46) -> str:
@@ -456,138 +600,363 @@ def build_order(price: float, atr: float, p: Dict) -> Optional[Dict]:
     }
 
 
+# ── Markdown results ─────────────────────────────────────────────────────────
+
+def save_results_md(candidates: List[Dict], scan_started: datetime,
+                    outdir: str = ".") -> str:
+    """Save the completed scan results as a timestamped Markdown file."""
+    path = Path(outdir) / f"binance_scan_{scan_started:%Y%m%d_%H%M%S}.md"
+
+    lines = [
+        "# Binance Spot Scanner Results",
+        "",
+        f"- **Scan time:** {scan_started:%Y-%m-%d %H:%M:%S}",
+        f"- **Budget:** ${BUDGET:.2f}",
+        "- **Quote pairs:** USDT / USDC",
+        f"- **Win-rate window:** {MIN_WR*100:.2f}% – {MAX_WR*100:.2f}%",
+        "- **Strategy:** RSI oversold bounce near 20-bar low",
+        f"- **Interval:** {INTERVAL}",
+        f"- **Candles per symbol:** {N_CANDLES}",
+        f"- **Pairs scanned:** up to {MAX_SCAN}",
+        f"- **Minimum 24h volume:** ${MIN_VOL:,.0f}",
+        "",
+    ]
+
+    if not candidates:
+        lines += [
+            "## Results",
+            "",
+            "No pairs matched the win-rate window at this moment.",
+            "",
+        ]
+    else:
+        lines += ["## Results", "", f"**{len(candidates)} candidate(s)**", ""]
+
+        for i, c in enumerate(candidates, 1):
+            pr  = c["price"]
+            atp = c["atr"] / pr * 100
+            ev  = c["wr"] * TP_MULT - (1 - c["wr"]) * SL_MULT
+
+            lines += [
+                f"### {i}. {c['symbol']} ({c['quote']} pair)",
+                "",
+                "| Metric | Value |",
+                "|---|---:|",
+                f"| Current Price | {fmt(pr)} {c['quote']} |",
+                f"| 24h Volume | {c['volume']:,.0f} {c['quote']} |",
+                f"| 24h Change | {c['chg24']:+.2f}% |",
+                f"| ATR ({INTERVAL}) | {fmt(c['atr'])} ({atp:.2f}%) |",
+                f"| Win Rate | {c['wr']*100:.2f}% ({c['sigs']} signals) |",
+                f"| R:R | {c['rr']:.1f}:1 |",
+                f"| Expected Value / Risk | {ev:+.3f} per $1 risked |",
+                "",
+                "#### Trade Setup",
+                "",
+                "| Order | Price | Distance from Entry |",
+                "|---|---:|---:|",
+                f"| Entry | {fmt(pr)} {c['quote']} | — |",
+                f"| TP | {fmt(c['tp'])} {c['quote']} | {pct(c['tp'], pr):+.2f}% |",
+                f"| SL Trigger | {fmt(c['trig'])} {c['quote']} | {pct(c['trig'], pr):+.2f}% |",
+                f"| SL Limit | {fmt(c['sl'])} {c['quote']} | {pct(c['sl'], pr):+.2f}% |",
+                "",
+                f"**Quantity:** {c['qty']:.6f} {c['base']}",
+                "",
+                f"- If TP hits: **{c['gain']:+.4f} {c['quote']}**",
+                f"- If SL hits: **{c['loss']:+.4f} {c['quote']}**",
+                "",
+            ]
+
+    lines += [
+        "## Execution",
+        "",
+        "1. Spot buy at ENTRY (market or limit).",
+        "2. Set OCO order: Limit sell @ TP | Stop-Limit: Trigger @ SL Trigger, Limit @ SL.",
+        "",
+        "> **Warning:** Backtest results do not guarantee future performance.",
+        "",
+    ]
+
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return str(path)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     log_path = init_logfile()
-    print()
-    print("╔══════════════════════════════════════════════════════════════════╗")
-    print("║      BINANCE SPOT SCANNER  ·  $10 Budget  ·  BNB Fees           ║")
-    print(f"║  Win Rate: {MIN_WR*100:.2f}%–{MAX_WR*100:.2f}%  ·  {TP_MULT:.0f}:1 R:R  ·  Interval: {INTERVAL}            ║")
-    print("╚══════════════════════════════════════════════════════════════════╝")
-    print()
+    scan_started = datetime.now()
 
-    # ── 1. Load pairs ─────────────────────────────────────────────────────
-    print("  [1/3]  Loading exchange info …")
-    pairs = get_pairs()
-    print(f"         {len(pairs)} USDT / USDC spot pairs eligible")
-    print()
+    log.header([
+        f"{BLD}BINANCE SPOT SCANNER  ·  ${BUDGET:.0f} Budget  ·  BNB Fees{RST}",
+        "",
+        f"  Budget        : ${BUDGET:.2f} USD",
+        f"  Win Rate      : {MIN_WR*100:.2f}% – {MAX_WR*100:.2f}%"
+        f"  (break-even @ {1/(1+TP_MULT/SL_MULT)*100:.2f}% for {TP_MULT:.0f}:1 R:R)",
+        f"  TP mult       : {TP_MULT}×ATR     SL mult : {SL_MULT}×ATR"
+        f"     Trigger : SL + {TRIG_MULT}×ATR",
+        f"  Candle TF     : {INTERVAL}   ·   {N_CANDLES} bars   ·   "
+        f"max scan: {MAX_SCAN} pairs",
+        f"  RSI window    : {RSI_LOW}–{RSI_HIGH}"
+        f"   ·   Near {LO_LOOKBACK}-bar low × {LO_MARGIN}"
+        f"   ·   ATR ≥ {MIN_ATR_PCT*100:.2f}%",
+        f"  Min signals   : {MIN_SIGNALS}"
+        f"   ·   Forward bars: {FWD_BARS}"
+        f"   ·   Cool-down: {COOL_DOWN} bars",
+        f"  Min 24h vol   : {MIN_VOL:,.0f} USDT",
+        f"  Log file      : {log_path}",
+    ])
 
-    # ── 2. Ticker filter ──────────────────────────────────────────────────
-    print("  [2/3]  Applying price & volume filter (≥ $300 k / 24 h) …")
-    pairs = enrich_ticker(pairs)
+    # ── 1. Exchange-info filter ──────────────────────────────────────────────
+    log.section("STEP 1 / 3  ·  EXCHANGE INFO FILTER")
+    log.info("Fetching https://api.binance.com/api/v3/exchangeInfo …")
+
+    data = GET(f"{BASE_URL}/api/v3/exchangeInfo")
+    if not data:
+        log.fail("Cannot reach Binance. Check your connection.")
+        sys.exit(1)
+    log.info(f"Total symbols in response      : {len(data['symbols']):>6,}")
+
+    pairs, counts = exchange_filter_counts(data, log)
+    log.raw()
+    log.info(f"  Status != TRADING            : {counts['NOT_TRADING']:>6,}")
+    log.info(f"  Wrong quote (not USDT/USDC)  : {counts['WRONG_QUOTE']:>6,}")
+    log.info(f"  Spot not allowed             : {counts['NOT_SPOT']:>6,}")
+    log.info(f"  Min notional > ${BUDGET:.2f}       : {counts['HIGH_NOTIONAL']:>6,}")
+    log.ok(  f"  Eligible pairs               : {counts['PASSED']:>6,}")
+
+    # ── 2. Ticker filter ─────────────────────────────────────────────────────
+    log.section("STEP 2 / 3  ·  24 H TICKER FILTER")
+    log.info("Fetching https://api.binance.com/api/v3/ticker/24hr …")
+
+    pairs, tcounts = ticker_filter_counts(pairs, log)
     pairs.sort(key=lambda x: x["volume"], reverse=True)   # top volume first
     n_scan = min(len(pairs), MAX_SCAN)
-    print(f"         {len(pairs)} pairs pass — scanning top {n_scan} by 24 h volume")
-    print()
 
-    # ── 3. Candle scan & backtest ─────────────────────────────────────────
-    print(f"  [3/3]  Running backtest  ({INTERVAL} candles, ATR-14, RSI-14) …")
-    print()
+    log.raw()
+    log.info(f"  No ticker data               : {tcounts['NO_TICKER']:>6,}")
+    log.info(f"  Zero / invalid price         : {tcounts['ZERO_PRICE']:>6,}")
+    log.info(f"  Volume < {MIN_VOL/1e3:,.0f}k USDT           : {tcounts['LOW_VOL']:>6,}")
+    log.info(f"  Qty unaffordable             : {tcounts['UNAFFORDABLE']:>6,}")
+    log.ok(  f"  Pass → queued for scan       : {tcounts['PASSED']:>6,}")
+
+    if n_scan == 0:
+        log.fail("No pairs survived the filters. Exiting.")
+        return
+
+    # ── 3. Candle scan & backtest ────────────────────────────────────────────
+    log.section(f"STEP 3 / 3  ·  BACKTEST SCAN  "
+                f"({n_scan} pairs, sorted by 24h volume)")
+    log.info(f"Strategy : RSI({RSI_LOW}–{RSI_HIGH}) oversold + "
+             f"close ≤ {LO_LOOKBACK}-bar-low × {LO_MARGIN}")
+    log.info(f"Entry    : above conditions met simultaneously")
+    log.info(f"TP       : entry + {TP_MULT}×ATR(14)")
+    log.info(f"SL       : entry − {SL_MULT}×ATR(14)")
+    log.info(f"Win      : high reaches TP within {FWD_BARS} bars")
+    log.info(f"Loss     : low reaches SL first")
+    log.raw()
 
     candidates: List[Dict] = []
 
     for idx, p in enumerate(pairs[:n_scan], 1):
-        sym = p["symbol"]
-        print(f"         [{bar(idx, n_scan)}]  {idx:>3}/{n_scan}  {sym:<14}", end="\r", flush=True)
+        sym   = p["symbol"]
+        quote = p["quote"]
+        price = p["price"]
+        vol   = p["volume"]
+
+        log.pair_start(idx, n_scan, sym, fmt(price), vol, quote)
+        log.tree(False, "24h Volume", f"{vol:>18,.0f} {quote}")
+        log.tree(False, "24h Change", f"{p['chg24']:>+18.2f}%")
+
+        log.tree(False, "Candle fetch",
+                 f"GET /klines  symbol={sym}  interval={INTERVAL}  limit={N_CANDLES}")
 
         df = fetch_candles(sym)
         if df is None:
+            log.tree(True, "VERDICT",
+                     f"{RED}REJECTED{RST}  ·  CANDLE_FETCH_FAIL  "
+                     f"{DIM}API returned None / insufficient bars{RST}")
             time.sleep(0.06)
             continue
+
+        n_bars = len(df)
+        log.tree(False, "Candles",
+                 f"{n_bars} bars fetched  "
+                 f"({INTERVAL}, spanning ≈ {n_bars * _interval_hours(INTERVAL):.0f} h)",
+                 "ok")
 
         atr_s = calc_atr(df)
         av    = atr_s.iloc[-1]
         if np.isnan(av) or av == 0:
+            log.tree(True, "VERDICT",
+                     f"{RED}REJECTED{RST}  ·  ATR_INVALID  "
+                     f"{DIM}ATR(14)={'NaN' if np.isnan(av) else '0'}{RST}")
             time.sleep(0.06)
             continue
 
-        wr, sigs = backtest(df, atr_s, sym)
-        if wr is None:
+        atr_pct = av / price * 100
+        if atr_pct < MIN_ATR_PCT * 100:
+            log.tree(False, "ATR(14)",
+                     f"{fmt(av)}  ({atr_pct:.3f}% of price)", "fail")
+            log.tree(True, "VERDICT",
+                     f"{RED}REJECTED{RST}  ·  ATR_TOO_FLAT  "
+                     f"{DIM}{atr_pct:.3f}% < threshold {MIN_ATR_PCT*100:.2f}%  "
+                     f"(coin too flat to trade){RST}")
             time.sleep(0.07)
             continue
 
-        if MIN_WR <= wr <= MAX_WR:
-            order = build_order(p["price"], av, p)
-            if order is None:
-                time.sleep(0.08)
-                continue
+        log.tree(False, "ATR(14)",
+                 f"{fmt(av)}  ({atr_pct:.3f}% of price)  "
+                 f"[threshold: ≥ {MIN_ATR_PCT*100:.2f}%]", "ok")
 
-            candidates.append({
-                **p,
-                "atr"   : av,
-                "wr"    : wr,
-                "sigs"  : sigs,
-                **order,
-            })
+        log.tree(False, "Backtest",
+                 f"RSI({RSI_LOW}–{RSI_HIGH}) oversold + near {LO_LOOKBACK}-bar low  "
+                 f"→  TP={TP_MULT}×ATR / SL={SL_MULT}×ATR")
+
+        wins, losses, total_sigs, flat_skips = _backtest_detail(df, atr_s, sym)
+
+        log.tree(False, "Signals found",
+                 f"total={total_sigs}  wins={wins}  losses={losses}  "
+                 f"flat_candle_skips={flat_skips}")
+
+        if total_sigs < MIN_SIGNALS:
+            log.tree(True, "VERDICT",
+                     f"{RED}REJECTED{RST}  ·  FEW_SIGNALS  "
+                     f"{DIM}only {total_sigs} signals found, need ≥ {MIN_SIGNALS}{RST}")
+            time.sleep(0.07)
+            continue
+
+        wr = wins / total_sigs
+
+        in_range  = MIN_WR <= wr <= MAX_WR
+        wr_color  = GRN if in_range else RED
+        range_str = f"[{MIN_WR*100:.2f}%  –  {MAX_WR*100:.2f}%]"
+        be_wr     = 1 / (1 + TP_MULT / SL_MULT)     # break-even win rate
+
+        log.tree(False, "Win Rate",
+                 f"{wr_color}{BLD}{wr*100:.2f}%{RST}  in {range_str}  "
+                 f"{'✓ IN RANGE' if in_range else '✗ OUT OF RANGE'}  "
+                 f"{DIM}(break-even: {be_wr*100:.2f}%){RST}",
+                 "ok" if in_range else "fail")
+
+        if wr < MIN_WR:
+            log.tree(True, "VERDICT",
+                     f"{RED}REJECTED{RST}  ·  WR_TOO_LOW  "
+                     f"{DIM}{wr*100:.2f}% < {MIN_WR*100:.2f}%  "
+                     f"({total_sigs} signals){RST}")
+            time.sleep(0.08)
+            continue
+
+        if wr > MAX_WR:
+            log.tree(True, "VERDICT",
+                     f"{RED}REJECTED{RST}  ·  WR_TOO_HIGH  "
+                     f"{DIM}{wr*100:.2f}% > {MAX_WR*100:.2f}%  "
+                     f"({total_sigs} signals){RST}")
+            time.sleep(0.08)
+            continue
+
+        order = build_order(price, av, p)
+        if order is None:
+            log.tree(False, "Order check",
+                     f"{RED}invalid after quantization{RST}  "
+                     f"{DIM}qty/tick/step/notional or OCO ordering{RST}", "fail")
+            log.tree(True, "VERDICT",
+                     f"{RED}REJECTED{RST}  ·  ORDER_INVALID  "
+                     f"{DIM}executable levels violate Binance filters{RST}")
+            time.sleep(0.08)
+            continue
+
+        ev = wr * TP_MULT - (1 - wr) * SL_MULT
+        ev_color = GRN if ev > 0 else RED
+        log.tree(False, "R : R",       f"{order['rr']:.1f} : 1")
+        log.tree(False, "Exp. Value",  f"{ev_color}{ev:+.4f}{RST} per $1 risked  "
+                                       f"({'positive EV ✓' if ev > 0 else 'negative EV ✗'})")
+        log.tree(False, "TP",          f"{fmt(order['tp']):>14}  ({pct(order['tp'], price):>+7.2f}%)")
+        log.tree(False, "SL Trigger",  f"{fmt(order['trig']):>14}  ({pct(order['trig'], price):>+7.2f}%)  "
+                                       f"{DIM}← Binance stop price{RST}")
+        log.tree(False, "SL",          f"{fmt(order['sl']):>14}  ({pct(order['sl'], price):>+7.2f}%)  "
+                                       f"{DIM}← Binance limit price{RST}")
+        log.tree(False, f"Qty (${BUDGET:.0f})",
+                 f"{order['qty']:.6f} {p['base']}  →  "
+                 f"TP profit: {order['gain']:+.4f} {quote}  /  "
+                 f"SL loss: {order['loss']:+.4f} {quote}")
+
+        log.tree(True, "VERDICT",
+                 f"{GRN}{BLD}CANDIDATE ✓{RST}  {DIM}"
+                 f"WR={wr*100:.2f}%  EV={ev:+.4f}  R:R={order['rr']:.1f}:1  "
+                 f"signals={total_sigs}(W:{wins}/L:{losses}){RST}")
+
+        candidates.append({
+            **p,
+            "atr"   : av,
+            "wr"    : wr,
+            "sigs"  : total_sigs,
+            **order,
+        })
 
         time.sleep(0.08)   # stay well under Binance rate limits
 
-    print()
-    print()
+    # ── Results ──────────────────────────────────────────────────────────────
+    SEP = "═" * 70
 
-    # ── Results ───────────────────────────────────────────────────────────
-    SEP  = "═" * 68
-    sep2 = "─" * 64
+    log.section("CANDIDATES")
 
     if not candidates:
-        print("  ⚠   No pairs matched the win-rate window at this moment.")
-        print("      Markets shift hourly — re-run in a few hours.")
-        print()
-        print(f"  [LOG]  Full scan log saved → {log_path}")
-        print()
+        log.fail("No pairs matched the win-rate window during this run.")
+        log.info("Tip: the window is "
+                 f"{MIN_WR*100:.2f}%–{MAX_WR*100:.2f}%; markets shift — re-run later.")
+        log.raw()
+        md_file = save_results_md(candidates, scan_started)
+        log.info(f"Saved Markdown results → {md_file}")
+        log.info(f"Full scan log saved → {log_path}")
         return
 
     # Sort: highest win rate first; break ties by volume
     candidates.sort(key=lambda x: (x["wr"], x["volume"]), reverse=True)
 
-    print(SEP)
-    print(f"  RESULTS  ·  {len(candidates)} candidate(s)  ·  {datetime.now():%Y-%m-%d  %H:%M:%S}")
-    print(SEP)
-
     for i, c in enumerate(candidates, 1):
-        pr  = c["price"]
-        q   = c["quote"]
-        b   = c["base"]
-        atp = c["atr"] / pr * 100   # ATR as % of price
+        pr   = c["price"]
+        q    = c["quote"]
+        b    = c["base"]
+        atp  = c["atr"] / pr * 100   # ATR as % of price
+        ev   = c["wr"] * TP_MULT - (1 - c["wr"]) * SL_MULT
+        ev_c = GRN if ev > 0 else RED
 
-        ev = c["wr"] * TP_MULT - (1 - c["wr"]) * SL_MULT
-        ev_str = f"{ev:+.3f}"
+        log.raw(f"""
+{SEP}
+{BLD}  #{i}  {CYN}{c['symbol']}{RST}{BLD}  ·  {q} pair{RST}
+  {"─"*66}
+  Current Price    {fmt(pr):>20}  {q}
+  24h Volume       {c['volume']:>20,.0f}  {q}
+  24h Change       {c['chg24']:>+19.2f}%
+  ATR ({INTERVAL})         {fmt(c['atr']):>20}  ({atp:.3f}%)
+  Win Rate         {GRN}{BLD}{c['wr']*100:>19.2f}%{RST}   ({c['sigs']} signals)
+  R : R            {c['rr']:>19.1f} : 1
+  Exp. Value       {ev_c}{ev:>+19.4f}{RST}  (per $1 risked)
 
-        print(f"""
-  # {i}   {c['symbol']}   ({q} pair)
-  {sep2}
-  Current Price    {fmt(pr):>18}  {q}
-  24 h Volume      {c['volume']:>18,.0f}  {q}
-  24 h Change      {c['chg24']:>+17.2f} %
-  ATR ({INTERVAL})         {fmt(c['atr']):>18}  ({atp:.2f} %)
-  Win Rate         {c['wr']*100:>17.2f} %   ({c['sigs']} signals)
-  R : R            {c['rr']:>17.1f} : 1
-  Exp. Value/risk  {ev_str:>17}  (per $1 risked)
+  ┌─ ENTRY    ──── {fmt(pr):>20}  {q}
+  ├─ TP       ──── {GRN}{fmt(c['tp']):>20}{RST}  {q}   ({pct(c['tp'],  pr):>+7.2f}%)
+  ├─ SL Trig  ──── {YLW}{fmt(c['trig']):>20}{RST}  {q}   ({pct(c['trig'], pr):>+7.2f}%)
+  └─ SL       ──── {RED}{fmt(c['sl']):>20}{RST}  {q}   ({pct(c['sl'],  pr):>+7.2f}%)
 
-  ┌─ ENTRY    ──── {fmt(pr):>18}  {q}
-  ├─ TP       ──── {fmt(c['tp']):>18}  {q}   ({pct(c['tp'],  pr):>+7.2f} %)
-  ├─ SL Trig  ──── {fmt(c['trig']):>18}  {q}   ({pct(c['trig'], pr):>+7.2f} %)
-  └─ SL       ──── {fmt(c['sl']):>18}  {q}   ({pct(c['sl'],  pr):>+7.2f} %)
+  With ${BUDGET:.2f} budget:
+    Quantity   {c['qty']:>20.6f}  {b}
+    If TP hit  {c['gain']:>+20.4f}  {q}
+    If SL hit  {c['loss']:>+20.4f}  {q}""")
 
-  With ${BUDGET:.0f} budget:
-    Quantity     {c['qty']:>18.6f}  {b}
-    If TP hit    {c['gain']:>+18.4f}  {q}
-    If SL hit    {c['loss']:>+18.4f}  {q}""")
+    log.raw(SEP)
+    log.raw()
+    log.info("Binance OCO order:")
+    log.info("  ① Spot-buy at ENTRY (market or limit)")
+    log.info("  ② OCO sell:  Limit @ TP  |  Stop-Limit: stop=SL Trig, limit=SL")
 
-    print()
-    print(SEP)
-    print()
-    print("  How to place the trade on Binance:")
-    print("  ① Spot buy at ENTRY (market or limit)")
-    print("  ② Set OCO order:  Limit sell @ TP  |  Stop-Limit: Trigger @ SL Trig, Limit @ SL")
-    print()
-    print("  ⚠  Backtest ≠ future results.  Only trade what you can afford to lose.")
-    print()
-    print(SEP)
-    print()
-    print(f"  [LOG]  Full scan log saved → {log_path}")
-    print()
+    log.raw()
+    md_file = save_results_md(candidates, scan_started)
+    log.info(f"Saved Markdown results → {md_file}")
+    log.info(f"Full scan log saved → {log_path}")
+    log.raw()
+    log.raw(f"{DIM}  ⚠  Backtest ≠ live performance.  "
+            f"Only trade what you can afford to lose.{RST}")
+    log.raw()
 
 
 if __name__ == "__main__":
