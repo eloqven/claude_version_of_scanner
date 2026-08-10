@@ -118,4 +118,5 @@ Binance supports timestamp-bounded klines down to one second with up to 1,000 ro
 - Both scripts remain directly runnable and the prototype remains suitable for PoC demonstrations.
 - The deterministic test suite passes without live Binance access.
 - Optional live smoke scans complete without placing orders.
+- Every scan run (proto and V1) writes an always-on, timestamped UTF-8 log under `logs/` (`proto_YYYYmmdd_HHMMSS.log` / `v1_YYYYmmdd_HHMMSS.log`), and V1's `Logger._ts()` timestamps use the full date.
 - No unrelated files, documentation, or abandoned implementation attempts remain.

@@ -24,6 +24,7 @@ import sys
 import time
 from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -44,6 +45,53 @@ def _setup_console() -> None:
 
 
 _setup_console()
+
+
+# ── File logging ──────────────────────────────────────────────────────────────
+
+class _Tee:
+    """Duplicate console output into a UTF-8 log file with line timestamps."""
+
+    def __init__(self, target, fh) -> None:
+        self._target = target
+        self._fh = fh
+        self._line_start = True
+
+    def write(self, text: str) -> int:
+        self._target.write(text)
+        if self._line_start and text:
+            self._fh.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] ")
+            self._line_start = False
+        self._fh.write(text.replace("\r", "\n"))
+        self._fh.flush()
+        self._line_start = text.endswith("\n")
+        return len(text)
+
+    def flush(self) -> None:
+        self._target.flush()
+        self._fh.flush()
+
+    def isatty(self) -> bool:
+        return False
+
+
+_LOG_ACTIVE = False
+_LOG_PATH = ""
+
+
+def init_logfile(prefix: str = "proto", logdir: str = "logs") -> str:
+    """Tee stdout/stderr into a timestamped UTF-8 log file. Returns its path."""
+    global _LOG_ACTIVE, _LOG_PATH
+    if _LOG_ACTIVE:
+        return _LOG_PATH
+    path = Path(logdir) / f"{prefix}_{datetime.now():%Y%m%d_%H%M%S}.log"
+    Path(logdir).mkdir(parents=True, exist_ok=True)
+    fh = open(path, "w", encoding="utf-8")
+    sys.stdout = _Tee(sys.stdout, fh)
+    sys.stderr = _Tee(sys.stderr, fh)
+    _LOG_ACTIVE = True
+    _LOG_PATH = str(path)
+    return _LOG_PATH
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 BASE_URL    = "https://api.binance.com"
@@ -411,6 +459,7 @@ def build_order(price: float, atr: float, p: Dict) -> Optional[Dict]:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    log_path = init_logfile()
     print()
     print("╔══════════════════════════════════════════════════════════════════╗")
     print("║      BINANCE SPOT SCANNER  ·  $10 Budget  ·  BNB Fees           ║")
@@ -485,6 +534,8 @@ def main() -> None:
         print("  ⚠   No pairs matched the win-rate window at this moment.")
         print("      Markets shift hourly — re-run in a few hours.")
         print()
+        print(f"  [LOG]  Full scan log saved → {log_path}")
+        print()
         return
 
     # Sort: highest win rate first; break ties by volume
@@ -534,6 +585,8 @@ def main() -> None:
     print("  ⚠  Backtest ≠ future results.  Only trade what you can afford to lose.")
     print()
     print(SEP)
+    print()
+    print(f"  [LOG]  Full scan log saved → {log_path}")
     print()
 
 

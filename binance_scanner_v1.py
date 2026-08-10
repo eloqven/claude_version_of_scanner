@@ -105,7 +105,7 @@ class Logger:
         self._fh = open(path, "w", encoding="utf-8") if path else None
 
     def _ts(self) -> str:
-        return datetime.now().strftime("%H:%M:%S")
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def _emit(self, line: str) -> None:
         print(line)
@@ -1178,12 +1178,20 @@ def validate_config(cfg: Config, parser: argparse.ArgumentParser) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 #  Main
 # ══════════════════════════════════════════════════════════════════════════════
+def default_log_path(prefix: str = "v1", logdir: str = "logs") -> str:
+    """Default timestamped log path when --log-file is not given."""
+    return str(Path(logdir) / f"{prefix}_{datetime.now():%Y%m%d_%H%M%S}.log")
+
+
 def main() -> None:
     cfg, want_history = parse_args()
 
     if want_history:
         show_history(cfg.db_path)
         return
+
+    if not cfg.log_file:
+        cfg.log_file = default_log_path("v1")
 
     log = Logger(cfg.log_file)
 

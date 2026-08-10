@@ -645,5 +645,45 @@ class TestHistoryIncomplete(unittest.TestCase):
         self.assertNotIn("GHOSTUSDT", text)
 
 
+class TestLogfileTee(unittest.TestCase):
+    """Always-on timestamped log file - proto console output lands in a log file."""
+
+    def test_init_logfile_tees_stdout_with_timestamps(self):
+        real_out = sys.stdout
+        with tempfile.TemporaryDirectory() as td:
+            path = proto.init_logfile(prefix="proto", logdir=td)
+            tee = sys.stdout
+            try:
+                self.assertTrue(os.path.isfile(path))
+                self.assertTrue(os.path.basename(path).startswith("proto_"))
+                self.assertRegex(os.path.basename(path),
+                                 r"^proto_\d{8}_\d{6}\.log$")
+                print("hello log")
+                print("line two")
+                sys.stdout.flush()
+                self.assertEqual(proto._LOG_PATH, path)
+            finally:
+                sys.stdout = real_out
+                proto._LOG_ACTIVE = False
+                tee._fh.close()
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        self.assertIn("[", text)
+        self.assertRegex(text, r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]")
+        self.assertIn("hello log", text)
+        self.assertIn("line two", text)
+
+
+class TestDefaultLogPath(unittest.TestCase):
+    """V1 - default log path is timestamped under the logs dir."""
+
+    def test_default_log_path_timestamped(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = v1.default_log_path("v1", td)
+            self.assertTrue(os.path.basename(path).startswith("v1_"))
+            self.assertRegex(os.path.basename(path),
+                             r"^v1_\d{8}_\d{6}\.log$")
+
+
 if __name__ == "__main__":
     unittest.main()
