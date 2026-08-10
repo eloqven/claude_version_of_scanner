@@ -27,6 +27,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -369,10 +370,11 @@ def step_exchange(cfg: Config, log: Logger) -> List[Dict]:
 
         fmap    = {f["filterType"]: f for f in s["filters"]}
         nf      = fmap.get("NOTIONAL") or fmap.get("MIN_NOTIONAL") or {}
-        min_val = float(nf.get("minNotional", 1.0))
-        if min_val > cfg.budget:
+        min_val = Decimal(nf.get("minNotional", "1.0"))
+        if min_val > Decimal(str(cfg.budget)):
             counts["HIGH_NOTIONAL"] += 1
-            log.skip(f"{sym:<18} HIGH_MIN_NOTIONAL  minNotional={min_val:.2f} > budget={cfg.budget:.2f}")
+            log.skip(f"{sym:<18} HIGH_MIN_NOTIONAL  "
+                     f"minNotional={min_val:.2f} > budget={cfg.budget:.2f}")
             continue
 
         lot_f  = fmap.get("LOT_SIZE", {})
@@ -383,8 +385,9 @@ def step_exchange(cfg: Config, log: Logger) -> List[Dict]:
             base    = s["baseAsset"],
             quote   = s["quoteAsset"],
             min_val = min_val,
-            step    = float(lot_f.get("stepSize",  "0.01")),
-            tick    = float(tick_f.get("tickSize", "0.0001")),
+            min_qty = Decimal(lot_f.get("minQty", "0")),
+            step    = Decimal(lot_f.get("stepSize",  "0.01")),
+            tick    = Decimal(tick_f.get("tickSize", "0.0001")),
         ))
 
     # Summary
@@ -627,6 +630,53 @@ def _backtest(df: pd.DataFrame, atr_s: pd.Series, cfg: Config,
     return wins, losses, wins + losses, flat_skips
 
 
+# ── Binance-valid order construction (R3 / KTD2 / KTD3) ───────────────────────
+
+def _floor_step(v: Decimal, step: Decimal) -> Decimal:
+    """Round quantity (or price) down to an exact step multiple."""
+    if step <= 0:
+        return v
+    return v - (v % step)
+
+
+def _ceil_tick(v: Decimal, tick: Decimal) -> Decimal:
+    """Round a price up to an exact tick multiple."""
+    if tick <= 0:
+        return v
+    rem = v % tick
+    if rem == 0:
+        return v
+    return v + (tick - rem)
+
+
+def build_order(price: float, atr: float, cfg: Config, p: Dict) -> Optional[Tuple[float, float, float, float]]:
+    """
+    Quantize qty / TP / trigger / SL per KTD3 and validate against the
+    symbol filters (R3). Returns (tp, sl, trig, qty) as floats, or None
+    when the executable order is invalid.
+    """
+    pr   = Decimal(str(price))
+    av   = Decimal(str(atr))
+
+    qty  = _floor_step(Decimal(str(cfg.budget)) / pr, p["step"])
+    tp   = _ceil_tick(pr + av * Decimal(str(cfg.tp_mult)),  p["tick"])
+    sl   = _floor_step(pr - av * Decimal(str(cfg.sl_mult)), p["tick"])
+    trig = _ceil_tick(sl + av * Decimal(str(cfg.trig_mult)), p["tick"])
+
+    if qty <= 0:
+        return None
+    if p["min_qty"] > 0 and qty < p["min_qty"]:
+        return None
+    if qty * pr < p["min_val"]:
+        return None
+    if qty * pr > Decimal(str(cfg.budget)):
+        return None
+    if not (tp > pr > trig > sl):
+        return None
+
+    return float(tp), float(sl), float(trig), float(qty)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Step 3 — per-pair scan  (the verbose heart of the scanner)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -777,15 +827,25 @@ def scan_pair(p: Dict, idx: int, total: int, run_id: int,
         return _save("REJECTED", "WR_TOO_HIGH",
                      f"WR={wr_pct:.2f}% > {cfg.max_wr*100:.2f}% ({total_sigs} signals)")
 
-    # ── 4. Compute levels ─────────────────────────────────────────────────────
-    tp   = price + av * cfg.tp_mult
-    sl   = price - av * cfg.sl_mult
-    trig = sl    + av * cfg.trig_mult
-    qty  = cfg.budget / price
+    # ── 4. Compute levels (Binance-valid quantization) ────────────────────────
+    order = build_order(price, av, cfg, p)
+    ev    = wr * cfg.tp_mult - (1 - wr) * cfg.sl_mult
+
+    if order is None:
+        log.tree(False, "Order check",
+                 f"{RED}invalid after quantization{RST}  "
+                 f"{DIM}qty/tick/step/notional or OCO ordering{RST}", "fail")
+        log.tree(True, "VERDICT",
+                 f"{RED}REJECTED{RST}  ·  ORDER_INVALID  "
+                 f"{DIM}executable levels violate Binance filters{RST}")
+        return _save("REJECTED", "ORDER_INVALID",
+                     f"quantized order violates filters (min_qty={p['min_qty']}, "
+                     f"min_notional={p['min_val']}, step={p['step']}, tick={p['tick']})")
+
+    tp, sl, trig, qty = order
     gain =  (tp - price) * qty
     loss = -(price - sl) * qty
     rr   =  (tp - price) / max(price - sl, 1e-12)
-    ev   =  wr * cfg.tp_mult - (1 - wr) * cfg.sl_mult
 
     row.update(dict(
         tp=round(tp, 10), sl=round(sl, 10), sl_trigger=round(trig, 10),

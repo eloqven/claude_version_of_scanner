@@ -408,5 +408,126 @@ class TestDrillDown(unittest.TestCase):
         self.assertEqual((wins, losses, total), (0, 1, 1))
 
 
+class TestOrderQuantization(unittest.TestCase):
+    """R3 - orders must be exact tick/step multiples and pass validation."""
+
+    def _pair(self, tick="0.5", step="0.001", min_qty="0", min_notional="5"):
+        return {
+            "symbol": "TESTUSDT", "base": "TEST", "quote": "USDT",
+            "min_val": Decimal(min_notional), "min_qty": Decimal(min_qty),
+            "step": Decimal(step), "tick": Decimal(tick),
+        }
+
+    def test_proto_order_quantized_to_tick_and_step(self):
+        order = proto.build_order(100.0, 1.3, self._pair())
+        self.assertIsNotNone(order)
+        tick, step = 0.5, 0.001
+        self.assertAlmostEqual(order["qty"] / step, round(order["qty"] / step), places=6)
+        self.assertAlmostEqual(order["tp"] % tick, 0.0, places=6)
+        self.assertAlmostEqual(order["trig"] % tick, 0.0, places=6)
+        self.assertAlmostEqual(order["sl"] % tick, 0.0, places=6)
+        self.assertGreaterEqual(order["tp"], 100 + 8 * 1.3)    # TP rounded up
+        self.assertLessEqual(order["sl"], 100 - 1.3)           # SL rounded down
+        self.assertAlmostEqual(order["gain"],
+                               (order["tp"] - 100) * order["qty"], places=6)
+
+    def test_v1_order_quantized_to_tick_and_step(self):
+        cfg = v1.Config()
+        order = v1.build_order(100.0, 1.3, cfg, self._pair())
+        self.assertIsNotNone(order)
+        tp, sl, trig, qty = order
+        tick, step = 0.5, 0.001
+        self.assertAlmostEqual(qty / step, round(qty / step), places=6)
+        self.assertAlmostEqual(tp % tick, 0.0, places=6)
+        self.assertAlmostEqual(trig % tick, 0.0, places=6)
+        self.assertAlmostEqual(sl % tick, 0.0, places=6)
+        self.assertGreaterEqual(tp, 100 + 8 * 1.3)
+        self.assertLessEqual(sl, 100 - 1.3)
+
+    def test_proto_rejects_below_min_qty(self):
+        self.assertIsNone(proto.build_order(100.0, 1.3, self._pair(min_qty="1")))
+
+    def test_proto_rejects_below_min_notional(self):
+        self.assertIsNone(proto.build_order(100.0, 1.3, self._pair(min_notional="50")))
+
+    def test_v1_rejects_below_min_notional(self):
+        cfg = v1.Config()
+        self.assertIsNone(v1.build_order(100.0, 1.3, cfg, self._pair(min_notional="50")))
+
+    def _scan_df(self):
+        """120-bar fixture with valid RSI (declines + dips) and ~1.3% ATR."""
+        n_bars = 120
+        close = [100.0]
+        for i in range(1, n_bars):
+            if i <= 36:
+                close.append(close[-1] * 0.99)
+            elif i == 37:
+                close.append(close[-1] * 1.05)
+            elif i % 2 == 0:
+                close.append(close[-1] * 1.015)
+            else:
+                close.append(close[-1] * 0.997)
+        ts = [i * 4 * 3600 * 1000 for i in range(n_bars)]
+        open_ = [close[0]] + close[:-1]
+        high = [max(o, c) * 1.0065 for o, c in zip(open_, close)]
+        low = [min(o, c) * 0.9935 for o, c in zip(open_, close)]
+        return pd.DataFrame({"ts": ts, "open": open_, "high": high, "low": low,
+                             "close": close, "vol": [1000.0] * n_bars,
+                             "qvol": [1e6] * n_bars})
+
+    def test_v1_scan_pair_persists_quantized_order(self):
+        df = self._scan_df()
+
+        p = self._pair()
+        p.update({"symbol": "TESTUSDT", "base": "TEST", "quote": "USDT",
+                  "price": 100.0, "volume": 5e6, "chg24": 1.0})
+        cfg = v1.Config(rsi_low=0, rsi_high=100, lo_margin=100.0,
+                        min_atr_pct=0.001, min_wr=0.0, max_wr=1.0,
+                        min_signals=1, fwd_bars=72, n_candles=120)
+        log = v1.Logger("")
+        with tempfile.TemporaryDirectory() as td:
+            conn = v1.db_open(os.path.join(td, "scanner.db"), log)
+            with _Quiet():
+                with mock.patch.object(v1, "_candles", return_value=df):
+                    is_cand = v1.scan_pair(p, 1, 1, 1, cfg, log, conn)
+            row = conn.execute(
+                "SELECT * FROM pair_scans WHERE run_id=1").fetchone()
+            cols = [d[0] for d in conn.execute(
+                "SELECT * FROM pair_scans WHERE run_id=1").description]
+            conn.close()
+        self.assertTrue(is_cand)
+        r = dict(zip(cols, row))
+        self.assertEqual(r["status"], "CANDIDATE")
+        tick, step = 0.5, 0.001
+        self.assertAlmostEqual(r["qty"] / step, round(r["qty"] / step), places=6)
+        self.assertAlmostEqual(r["tp"] % tick, 0.0, places=6)
+        self.assertAlmostEqual(r["sl_trigger"] % tick, 0.0, places=6)
+        self.assertAlmostEqual(r["sl"] % tick, 0.0, places=6)
+
+    def test_v1_scan_pair_rejects_invalid_order(self):
+        df = self._scan_df()
+
+        p = self._pair(min_qty="1")
+        p.update({"symbol": "TESTUSDT", "base": "TEST", "quote": "USDT",
+                  "price": 100.0, "volume": 5e6, "chg24": 1.0})
+        cfg = v1.Config(rsi_low=0, rsi_high=100, lo_margin=100.0,
+                        min_atr_pct=0.001, min_wr=0.0, max_wr=1.0,
+                        min_signals=1, fwd_bars=72, n_candles=120)
+        log = v1.Logger("")
+        with tempfile.TemporaryDirectory() as td:
+            conn = v1.db_open(os.path.join(td, "scanner.db"), log)
+            with _Quiet():
+                with mock.patch.object(v1, "_candles", return_value=df):
+                    is_cand = v1.scan_pair(p, 1, 1, 1, cfg, log, conn)
+            row = conn.execute(
+                "SELECT * FROM pair_scans WHERE run_id=1").fetchone()
+            cols = [d[0] for d in conn.execute(
+                "SELECT * FROM pair_scans WHERE run_id=1").description]
+            conn.close()
+        self.assertFalse(is_cand)
+        r = dict(zip(cols, row))
+        self.assertEqual(r["status"], "REJECTED")
+        self.assertEqual(r["reason"], "ORDER_INVALID")
+
 if __name__ == "__main__":
     unittest.main()

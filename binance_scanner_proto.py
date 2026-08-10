@@ -23,6 +23,7 @@ Run:
 import sys
 import time
 from datetime import datetime
+from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -124,8 +125,8 @@ def get_pairs() -> List[Dict]:
 
         # min notional — Binance uses "NOTIONAL" in newer response, "MIN_NOTIONAL" in older
         nf      = fmap.get("NOTIONAL") or fmap.get("MIN_NOTIONAL") or {}
-        min_val = float(nf.get("minNotional", 1.0))
-        if min_val > BUDGET:
+        min_val = Decimal(nf.get("minNotional", "1.0"))
+        if min_val > Decimal(str(BUDGET)):
             continue
 
         lot_f  = fmap.get("LOT_SIZE", {})
@@ -136,8 +137,9 @@ def get_pairs() -> List[Dict]:
             base    = s["baseAsset"],
             quote   = s["quoteAsset"],
             min_val = min_val,
-            step    = float(lot_f.get("stepSize",  "0.01")),
-            tick    = float(tick_f.get("tickSize", "0.0001")),
+            min_qty = Decimal(lot_f.get("minQty", "0")),
+            step    = Decimal(lot_f.get("stepSize",  "0.01")),
+            tick    = Decimal(tick_f.get("tickSize", "0.0001")),
         ))
 
     return pairs
@@ -347,6 +349,65 @@ def bar(n: int, total: int, width: int = 46) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+# ── Order construction (Binance-valid) ────────────────────────────────────────
+
+def _floor_step(v: Decimal, step: Decimal) -> Decimal:
+    """Round quantity down to an exact step multiple."""
+    if step <= 0:
+        return v
+    return v - (v % step)
+
+
+def _ceil_tick(v: Decimal, tick: Decimal) -> Decimal:
+    """Round a price up to an exact tick multiple."""
+    if tick <= 0:
+        return v
+    rem = v % tick
+    if rem == 0:
+        return v
+    return v + (tick - rem)
+
+
+def build_order(price: float, atr: float, p: Dict) -> Optional[Dict]:
+    """
+    Quantize qty / TP / trigger / SL to Binance-valid values (KTD3) and
+    validate them against the symbol filters (R3). Returns the executable
+    order dict, or None when validation fails.
+    """
+    pr = Decimal(str(price))
+    av = Decimal(str(atr))
+
+    qty  = _floor_step(Decimal(str(BUDGET)) / pr, p["step"])
+    tp   = _ceil_tick(pr + av * Decimal(str(TP_MULT)),  p["tick"])
+    sl   = _floor_step(pr - av * Decimal(str(SL_MULT)), p["tick"])
+    trig = _ceil_tick(sl + av * Decimal(str(TRIG_MULT)), p["tick"])
+
+    if qty <= 0:
+        return None
+    if p["min_qty"] > 0 and qty < p["min_qty"]:
+        return None
+    if qty * pr < p["min_val"]:
+        return None
+    if qty * pr > Decimal(str(BUDGET)):
+        return None
+    if not (tp > pr > trig > sl):
+        return None
+
+    gain = (tp - pr) * qty
+    loss = (pr - sl) * qty
+    rr   = (tp - pr) / max(pr - sl, Decimal("1e-12"))
+
+    return {
+        "tp"    : float(tp),
+        "sl"    : float(sl),
+        "trig"  : float(trig),
+        "qty"   : float(qty),
+        "gain"  : float(gain),
+        "loss"  : -float(loss),   # shown as negative
+        "rr"    : float(rr),
+    }
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -398,25 +459,17 @@ def main() -> None:
             continue
 
         if MIN_WR <= wr <= MAX_WR:
-            pr   = p["price"]
-            tp   = pr + av * TP_MULT
-            sl   = pr - av * SL_MULT
-            trig = sl + av * TRIG_MULT      # trigger fires before limit executes
-            qty  = BUDGET / pr
-            rr   = (tp - pr) / max(pr - sl, 1e-12)
+            order = build_order(p["price"], av, p)
+            if order is None:
+                time.sleep(0.08)
+                continue
 
             candidates.append({
                 **p,
                 "atr"   : av,
                 "wr"    : wr,
                 "sigs"  : sigs,
-                "tp"    : tp,
-                "sl"    : sl,
-                "trig"  : trig,
-                "qty"   : qty,
-                "gain"  :  (tp - pr) * qty,
-                "loss"  : -(pr - sl) * qty,   # shown as negative
-                "rr"    : rr,
+                **order,
             })
 
         time.sleep(0.08)   # stay well under Binance rate limits
