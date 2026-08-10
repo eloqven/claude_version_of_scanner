@@ -110,3 +110,8 @@ paginated, searchable table.
 - `--interval`/ranges are validated up front — invalid values exit with a usage error listing the allowed choices.
 - Scans are rate-limit-safe (sleep between calls); a full 200-pair proto run takes several minutes by design.
 - Stop the dashboard with `Ctrl+C`.
+
+---
+
+*Maintained with [Scout](scout), the local assistant. Commits are signed-off to
+trace changes back to the session that made them.*
