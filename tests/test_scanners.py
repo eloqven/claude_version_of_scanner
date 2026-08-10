@@ -529,5 +529,121 @@ class TestOrderQuantization(unittest.TestCase):
         self.assertEqual(r["status"], "REJECTED")
         self.assertEqual(r["reason"], "ORDER_INVALID")
 
+class TestCliValidation(unittest.TestCase):
+    """R8 - invalid CLI ranges and relationships must fail during parsing."""
+
+    def _parse(self, *argv):
+        old = sys.argv
+        sys.argv = ["binance_scanner.py"] + list(argv)
+        try:
+            return v1.parse_args()
+        finally:
+            sys.argv = old
+
+    def test_defaults_parse_ok(self):
+        cfg, hist = self._parse()
+        self.assertFalse(hist)
+        self.assertAlmostEqual(cfg.budget, 10.0)
+
+    def test_valid_boundaries_parse_ok(self):
+        cfg, _ = self._parse("--budget", "25", "--min-wr", "1", "--max-wr", "99",
+                             "--interval", "1m", "--n-candles", "1000",
+                             "--trig-mult", "0.1", "--sl-mult", "2")
+        self.assertAlmostEqual(cfg.min_wr, 0.01)
+        self.assertAlmostEqual(cfg.max_wr, 0.99)
+
+    def test_inverted_win_rate_rejected(self):
+        with self.assertRaises(SystemExit):
+            self._parse("--min-wr", "20", "--max-wr", "5")
+
+    def test_zero_budget_rejected(self):
+        with self.assertRaises(SystemExit):
+            self._parse("--budget", "0")
+
+    def test_trig_not_below_sl_rejected(self):
+        with self.assertRaises(SystemExit):
+            self._parse("--trig-mult", "2", "--sl-mult", "1")
+
+    def test_unknown_interval_rejected(self):
+        with self.assertRaises(SystemExit):
+            self._parse("--interval", "7x")
+
+    def test_n_candles_below_60_rejected(self):
+        with self.assertRaises(SystemExit):
+            self._parse("--n-candles", "50")
+
+    def test_n_candles_above_1000_rejected(self):
+        with self.assertRaises(SystemExit):
+            self._parse("--n-candles", "2000")
+
+    def test_insufficient_forward_window_rejected(self):
+        with self.assertRaises(SystemExit):
+            self._parse("--n-candles", "150", "--fwd-bars", "120")
+
+    def test_inverted_rsi_bounds_rejected(self):
+        with self.assertRaises(SystemExit):
+            self._parse("--rsi-low", "50", "--rsi-high", "20")
+
+
+class TestSignalCountPersisted(unittest.TestCase):
+    """R10 - actual signal count is persisted before minimum-signal rejection."""
+
+    def test_few_signals_row_keeps_n_signals(self):
+        df = TestOrderQuantization()._scan_df()
+        p = TestOrderQuantization()._pair()
+        p.update({"symbol": "TESTUSDT", "base": "TEST", "quote": "USDT",
+                  "price": 100.0, "volume": 5e6, "chg24": 1.0})
+        cfg = v1.Config(rsi_low=0, rsi_high=100, lo_margin=100.0,
+                        min_atr_pct=0.001, min_wr=0.0, max_wr=1.0,
+                        min_signals=99, fwd_bars=72, n_candles=120)
+        log = v1.Logger("")
+        with tempfile.TemporaryDirectory() as td:
+            conn = v1.db_open(os.path.join(td, "scanner.db"), log)
+            with _Quiet():
+                with mock.patch.object(v1, "_candles", return_value=df):
+                    is_cand = v1.scan_pair(p, 1, 1, 1, cfg, log, conn)
+            row = conn.execute(
+                "SELECT status, reason, n_signals FROM pair_scans").fetchone()
+            conn.close()
+        self.assertFalse(is_cand)
+        self.assertEqual(row[0], "REJECTED")
+        self.assertEqual(row[1], "FEW_SIGNALS")
+        self.assertGreater(row[2], 0)          # actual count kept, not 0
+
+
+class TestHistoryIncomplete(unittest.TestCase):
+    """R11 - interrupted runs render INCOMPLETE; completed summary excludes them."""
+
+    def _cand_row(self, run_id, symbol):
+        return dict(run_id=run_id, vol_rank=1, symbol=symbol, base=symbol[:3],
+                    quote="USDT", price=1.0, volume_24h=1e6, change_24h=1.0,
+                    atr=0.1, atr_pct=1.0, win_rate=0.1, n_signals=10,
+                    wins=1, losses=9, flat_skips=0, tp=2.0, sl=0.5,
+                    sl_trigger=0.6, qty=10.0, pot_gain=10.0, pot_loss=-5.0,
+                    rr_ratio=2.0, ev_per_risk=0.1, status="CANDIDATE",
+                    reason="WR_IN_RANGE", reason_detail="", scanned_at="2026-01-01T00:00:00")
+
+    def test_interrupted_run_rendered_incomplete(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = os.path.join(td, "scanner.db")
+            log = v1.Logger("")
+            conn = v1.db_open(db_path, log)
+            run_incomplete = v1.db_insert_run(conn, v1.Config())
+            run_final = v1.db_insert_run(conn, v1.Config())
+            v1.db_finalise_run(conn, run_final, 1, 1, 1, 1, 1.0)
+            v1.db_insert_pair(conn, self._cand_row(run_incomplete, "GHOSTUSDT"))
+            v1.db_insert_pair(conn, self._cand_row(run_final, "KEEPUSDT"))
+            conn.close()
+
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                v1.show_history(db_path)
+            text = out.getvalue()
+
+        self.assertIn("INCOMPLETE", text)
+        self.assertIn("KEEPUSDT", text)
+        self.assertNotIn("GHOSTUSDT", text)
+
+
 if __name__ == "__main__":
     unittest.main()

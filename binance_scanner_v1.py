@@ -787,6 +787,8 @@ def scan_pair(p: Dict, idx: int, total: int, run_id: int,
              f"total={total_sigs}  wins={wins}  losses={losses}  "
              f"flat_candle_skips={flat_skips}")
 
+    row["n_signals"] = total_sigs
+
     if total_sigs < cfg.min_signals:
         log.tree(True, "VERDICT",
                  f"{RED}REJECTED{RST}  ·  FEW_SIGNALS  "
@@ -795,7 +797,6 @@ def scan_pair(p: Dict, idx: int, total: int, run_id: int,
         return _save("REJECTED", "FEW_SIGNALS",
                      f"got {total_sigs} signals (need ≥ {cfg.min_signals})")
 
-    row["n_signals"] = total_sigs
     wr = wins / total_sigs
     row["win_rate"] = round(wr, 6)
 
@@ -975,6 +976,13 @@ def show_history(db_path: str) -> None:
 
     for run in runs:
         r = dict(run)
+        if r.get("n_scanned") is None:
+            print(
+                f"  {r['id']:>4}  {r['run_at']:<20}  "
+                f"{YLW}{BLD}INCOMPLETE{RST}  "
+                f"run interrupted — results never finalised"
+            )
+            continue
         print(
             f"  {r['id']:>4}  {r['run_at']:<20}  "
             f"${r['budget']:>7.2f}  "
@@ -985,13 +993,13 @@ def show_history(db_path: str) -> None:
             f"{r.get('duration_s') or 0:>5.1f}s"
         )
 
-    # Recent candidates across all runs
+    # Recent candidates across all runs (completed runs only)
     cands = conn.execute(
         """SELECT ps.symbol, ps.quote, ps.win_rate, ps.ev_per_risk,
                   ps.rr_ratio, ps.n_signals, ps.scanned_at, sr.id as run_id
            FROM pair_scans ps
            JOIN scan_runs sr ON ps.run_id = sr.id
-           WHERE ps.status = 'CANDIDATE'
+           WHERE ps.status = 'CANDIDATE' AND sr.n_scanned IS NOT NULL
            ORDER BY ps.scanned_at DESC
            LIMIT 20"""
     ).fetchall()
@@ -1115,7 +1123,56 @@ examples:
         db_path     = args.db,
         log_file    = args.log_file,
     )
+    validate_config(cfg, p)
     return cfg, args.history
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CLI validation
+# ══════════════════════════════════════════════════════════════════════════════
+_VALID_INTERVALS = {"1s","1m","3m","5m","15m","30m","1h","2h","4h","6h","8h",
+                    "12h","1d","3d","1w","1M"}
+
+
+def validate_config(cfg: Config, parser: argparse.ArgumentParser) -> None:
+    """Reject invalid ranges and incompatible relationships before scanning."""
+    def _err(msg: str) -> None:
+        parser.error(msg)
+
+    if cfg.budget <= 0:
+        _err("--budget must be positive")
+    if not (0 < cfg.min_wr <= cfg.max_wr < 1):
+        _err("--min-wr / --max-wr must satisfy 0 < min-wr <= max-wr < 100%")
+    if cfg.tp_mult <= 0 or cfg.sl_mult <= 0:
+        _err("--tp-mult and --sl-mult must be positive")
+    if not (0 < cfg.trig_mult < cfg.sl_mult):
+        _err("--trig-mult must satisfy 0 < trig-mult < sl-mult")
+    if cfg.min_vol < 0:
+        _err("--min-vol cannot be negative")
+    if cfg.max_scan <= 0:
+        _err("--max-scan must be positive")
+    if cfg.interval not in _VALID_INTERVALS:
+        _err(f"--interval must be one of: {', '.join(sorted(_VALID_INTERVALS))}")
+    if not (60 <= cfg.n_candles <= 1000):
+        _err("--n-candles must be between 60 and 1000")
+    if not (0 <= cfg.rsi_low <= cfg.rsi_high <= 100):
+        _err("--rsi-low / --rsi-high must satisfy 0 <= rsi-low <= rsi-high <= 100")
+    if cfg.lo_lookback <= 0:
+        _err("--lo-lookback must be positive")
+    if cfg.lo_margin <= 0:
+        _err("--lo-margin must be positive")
+    if cfg.min_atr_pct < 0:
+        _err("--min-atr-pct cannot be negative")
+    if cfg.fwd_bars <= 0:
+        _err("--fwd-bars must be positive")
+    if cfg.cool_down < 0:
+        _err("--cool-down cannot be negative")
+    if cfg.min_signals <= 0:
+        _err("--min-signals must be positive")
+    min_start = max(cfg.lo_lookback + 15, 30)
+    if cfg.n_candles <= cfg.fwd_bars + min_start:
+        _err("--n-candles is too small for one full forward window "
+             f"(need > fwd-bars + {min_start})")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
