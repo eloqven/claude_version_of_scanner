@@ -479,9 +479,15 @@ def step_ticker(pairs: List[Dict], cfg: Config, log: Logger) -> List[Dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 #  Indicators
 # ══════════════════════════════════════════════════════════════════════════════
-def _candles(sym: str, interval: str, limit: int) -> Optional[pd.DataFrame]:
-    raw = _get(f"{BASE_URL}/api/v3/klines",
-               {"symbol": sym, "interval": interval, "limit": limit})
+def _candles(sym: str, interval: str, limit: int,
+             start_ms: Optional[int] = None,
+             end_ms: Optional[int] = None) -> Optional[pd.DataFrame]:
+    params: Dict = {"symbol": sym, "interval": interval, "limit": limit}
+    if start_ms is not None:
+        params["startTime"] = start_ms
+    if end_ms is not None:
+        params["endTime"] = end_ms
+    raw = _get(f"{BASE_URL}/api/v3/klines", params)
     if not raw:
         return None
     df = pd.DataFrame(raw, columns=[
@@ -510,7 +516,55 @@ def _rsi(close: pd.Series, n: int = 14) -> pd.Series:
 # ══════════════════════════════════════════════════════════════════════════════
 #  Backtest
 # ══════════════════════════════════════════════════════════════════════════════
-def _backtest(df: pd.DataFrame, atr_s: pd.Series, cfg: Config) -> Tuple[int, int, int, int]:
+_CHILD_INTERVAL = {
+    "1M": "1d", "1w": "1d", "3d": "1d",
+    "1d": "12h", "12h": "6h", "8h": "4h",
+    "6h": "2h", "4h": "2h", "2h": "1h",
+    "1h": "30m", "30m": "15m", "15m": "5m",
+    "5m": "1m", "3m": "1m", "1m": "1s",
+}
+
+_INTERVAL_MS = {
+    "1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
+    "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000, "6h": 21_600_000,
+    "8h": 28_800_000, "12h": 43_200_000, "1d": 86_400_000, "3d": 259_200_000,
+    "1w": 604_800_000, "1M": 2_592_000_000,
+}
+
+
+def _resolve_dual_hit(symbol: str, interval: str,
+                      open_ts_ms: int, close_ts_ms: int,
+                      tp_p: float, sl_p: float) -> str:
+    """Resolve a same-candle TP/SL dual hit by drilling into lower timeframes."""
+    child = _CHILD_INTERVAL.get(interval)
+    if child is None:
+        return "loss"
+    df = _candles(symbol, child, 1000, start_ms=open_ts_ms, end_ms=close_ts_ms)
+    if df is None or df.empty:
+        return "loss"
+    df = df[(df["ts"] >= open_ts_ms) & (df["ts"] < close_ts_ms)]
+    if df.empty:
+        return "loss"
+    for k in range(len(df)):
+        hit_tp = df["high"].iloc[k] >= tp_p
+        hit_sl = df["low"].iloc[k] <= sl_p
+        if hit_tp and not hit_sl:
+            return "win"
+        if hit_sl and not hit_tp:
+            return "loss"
+        if child == "1s":
+            return "loss"
+        c_open = int(df["ts"].iloc[k])
+        if k + 1 < len(df):
+            c_close = int(df["ts"].iloc[k + 1])
+        else:
+            c_close = c_open + _INTERVAL_MS.get(child, 0)
+        return _resolve_dual_hit(symbol, child, c_open, c_close, tp_p, sl_p)
+    return "loss"
+
+
+def _backtest(df: pd.DataFrame, atr_s: pd.Series, cfg: Config,
+              symbol: str) -> Tuple[int, int, int, int]:
     """
     Strategy: RSI oversold + price near 20-bar low → high R:R long.
     Returns (wins, losses, total_signals, flat_candle_skips).
@@ -520,7 +574,7 @@ def _backtest(df: pd.DataFrame, atr_s: pd.Series, cfg: Config) -> Tuple[int, int
     last_i = -(cfg.cool_down + 1)
     start  = max(cfg.lo_lookback + 14 + 1, 30)
 
-    for i in range(start, len(df) - 1):
+    for i in range(start, len(df) - cfg.fwd_bars):
         if i - last_i < cfg.cool_down:
             continue
 
@@ -547,12 +601,25 @@ def _backtest(df: pd.DataFrame, atr_s: pd.Series, cfg: Config) -> Tuple[int, int
         sl_p = pr - av * cfg.sl_mult
 
         # Forward outcome
-        for j in range(i + 1, min(i + cfg.fwd_bars + 1, len(df))):
-            if df["high"].iloc[j] >= tp_p:
+        for j in range(i + 1, i + cfg.fwd_bars + 1):
+            hi = df["high"].iloc[j]
+            lo = df["low"].iloc[j]
+            if hi >= tp_p and lo <= sl_p:
+                open_ms = int(df["ts"].iloc[j])
+                close_ms = open_ms + _INTERVAL_MS.get(cfg.interval, 0)
+                if j + 1 < len(df):
+                    close_ms = int(df["ts"].iloc[j + 1])
+                if _resolve_dual_hit(symbol, cfg.interval, open_ms, close_ms, tp_p, sl_p) == "win":
+                    wins += 1
+                else:
+                    losses += 1
+                last_i = i
+                break
+            if hi >= tp_p:
                 wins   += 1
                 last_i  = i
                 break
-            if df["low"].iloc[j] <= sl_p:
+            if lo <= sl_p:
                 losses += 1
                 last_i  = i
                 break
@@ -660,7 +727,7 @@ def scan_pair(p: Dict, idx: int, total: int, run_id: int,
              f"RSI({cfg.rsi_low}–{cfg.rsi_high}) oversold + near {cfg.lo_lookback}-bar low  "
              f"→  TP={cfg.tp_mult}×ATR / SL={cfg.sl_mult}×ATR")
 
-    wins, losses, total_sigs, flat_skips = _backtest(df, atr_s, cfg)
+    wins, losses, total_sigs, flat_skips = _backtest(df, atr_s, cfg, sym)
 
     row["wins"]       = wins
     row["losses"]     = losses

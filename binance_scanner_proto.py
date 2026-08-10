@@ -174,12 +174,17 @@ def enrich_ticker(pairs: List[Dict]) -> List[Dict]:
 
 # ── Candle data ───────────────────────────────────────────────────────────────
 
-def fetch_candles(symbol: str) -> Optional[pd.DataFrame]:
-    raw = GET(
-        f"{BASE_URL}/api/v3/klines",
-        {"symbol": symbol, "interval": INTERVAL, "limit": N_CANDLES},
-    )
-    if not raw or len(raw) < 60:
+def fetch_candles(symbol: str, interval: str = INTERVAL,
+                  start_ms: Optional[int] = None,
+                  end_ms: Optional[int] = None,
+                  limit: int = N_CANDLES) -> Optional[pd.DataFrame]:
+    params: Dict = {"symbol": symbol, "interval": interval, "limit": limit}
+    if start_ms is not None:
+        params["startTime"] = start_ms
+    if end_ms is not None:
+        params["endTime"] = end_ms
+    raw = GET(f"{BASE_URL}/api/v3/klines", params)
+    if not raw or (start_ms is None and len(raw) < 60):
         return None
 
     cols = ["ts", "open", "high", "low", "close", "vol",
@@ -208,7 +213,55 @@ def calc_rsi(close: pd.Series, n: int = 14) -> pd.Series:
 
 # ── Backtest ──────────────────────────────────────────────────────────────────
 
-def backtest(df: pd.DataFrame, atr_s: pd.Series) -> Tuple[Optional[float], int]:
+_CHILD_INTERVAL = {
+    "1M": "1d", "1w": "1d", "3d": "1d",
+    "1d": "12h", "12h": "6h", "8h": "4h",
+    "6h": "2h", "4h": "2h", "2h": "1h",
+    "1h": "30m", "30m": "15m", "15m": "5m",
+    "5m": "1m", "3m": "1m", "1m": "1s",
+}
+
+_INTERVAL_MS = {
+    "1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
+    "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000, "6h": 21_600_000,
+    "8h": 28_800_000, "12h": 43_200_000, "1d": 86_400_000, "3d": 259_200_000,
+    "1w": 604_800_000, "1M": 2_592_000_000,
+}
+
+
+def _resolve_dual_hit(symbol: str, interval: str,
+                      open_ts_ms: int, close_ts_ms: int,
+                      tp_p: float, sl_p: float) -> str:
+    """Resolve a same-candle TP/SL dual hit by drilling into lower timeframes."""
+    child = _CHILD_INTERVAL.get(interval)
+    if child is None:
+        return "loss"
+    df = fetch_candles(symbol, interval=child, start_ms=open_ts_ms,
+                       end_ms=close_ts_ms, limit=1000)
+    if df is None or df.empty:
+        return "loss"
+    df = df[(df["ts"] >= open_ts_ms) & (df["ts"] < close_ts_ms)]
+    if df.empty:
+        return "loss"
+    for k in range(len(df)):
+        hit_tp = df["high"].iloc[k] >= tp_p
+        hit_sl = df["low"].iloc[k] <= sl_p
+        if hit_tp and not hit_sl:
+            return "win"
+        if hit_sl and not hit_tp:
+            return "loss"
+        if child == "1s":
+            return "loss"
+        c_open = int(df["ts"].iloc[k])
+        if k + 1 < len(df):
+            c_close = int(df["ts"].iloc[k + 1])
+        else:
+            c_close = c_open + _INTERVAL_MS.get(child, 0)
+        return _resolve_dual_hit(symbol, child, c_open, c_close, tp_p, sl_p)
+    return "loss"
+
+
+def backtest(df: pd.DataFrame, atr_s: pd.Series, symbol: str) -> Tuple[Optional[float], int]:
     """
     Signal: RSI oversold (20–36) AND close ≤ 20-bar low × 1.025
     TP:     entry + ATR × TP_MULT      (8 ATR above)
@@ -222,7 +275,7 @@ def backtest(df: pd.DataFrame, atr_s: pd.Series) -> Tuple[Optional[float], int]:
     last_i = -(COOL_DOWN + 1)
     start  = max(LO_LOOKBACK + 14 + 1, 30)
 
-    for i in range(start, len(df) - 1):
+    for i in range(start, len(df) - FWD_BARS):
         if i - last_i < COOL_DOWN:
             continue
 
@@ -245,9 +298,20 @@ def backtest(df: pd.DataFrame, atr_s: pd.Series) -> Tuple[Optional[float], int]:
         sl_p = pr - av * SL_MULT
 
         # ── Forward outcome ──────────────────────────────────────────────────
-        for j in range(i + 1, min(i + FWD_BARS + 1, len(df))):
+        for j in range(i + 1, i + FWD_BARS + 1):
             hi = df["high"].iloc[j]
             lo = df["low"].iloc[j]
+            if hi >= tp_p and lo <= sl_p:
+                open_ms = int(df["ts"].iloc[j])
+                close_ms = open_ms + _INTERVAL_MS.get(INTERVAL, 0)
+                if j + 1 < len(df):
+                    close_ms = int(df["ts"].iloc[j + 1])
+                if _resolve_dual_hit(symbol, INTERVAL, open_ms, close_ms, tp_p, sl_p) == "win":
+                    wins += 1
+                else:
+                    losses += 1
+                last_i = i
+                break
             if hi >= tp_p:
                 wins   += 1
                 last_i  = i
@@ -328,7 +392,7 @@ def main() -> None:
             time.sleep(0.06)
             continue
 
-        wr, sigs = backtest(df, atr_s)
+        wr, sigs = backtest(df, atr_s, sym)
         if wr is None:
             time.sleep(0.07)
             continue
