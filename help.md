@@ -6,7 +6,7 @@ Requires `requests`, `numpy`, `pandas` (stdlib only otherwise). No API keys need
 ## Tests
 
 ```powershell
-python -m py_compile scanner_common.py binance_scanner_v1.py binance_scanner_proto.py log_dashboard.py
+python -m py_compile scanner_common.py binance_scanner_v1.py binance_scanner_proto.py binance_scanner_v2.py log_dashboard.py scanner_v2/*.py
 python -m unittest discover -s tests
 ```
 
@@ -79,6 +79,36 @@ Every run writes a timestamped `logs/proto_YYYYmmdd_HHMMSS.log` (the path is
 printed at the end) and saves the results as `binance_scan_YYYYmmdd_HHMMSS.md`
 in the project root (gitignored) — including when zero candidates are found.
 
+## V2 scanner — `binance_scanner_v2.py`
+
+V2 is research output only. It uses a Binance server-time cutoff, four
+paginated 500-candle requests, closed candles only, and reports all results as
+`IN_SAMPLE`. It freezes the opportunity set before testing adaptive targets;
+the TP hit-rate denominator includes wins, stop-trigger losses, and timeouts.
+
+```powershell
+# Scoped V2 scan
+python binance_scanner_v2.py --max-scan 3
+
+# Fixed custom interval; V2 obtains 1m data and resamples deterministically
+python binance_scanner_v2.py --interval 13m --max-scan 3
+
+# View V2 history
+python binance_scanner_v2.py --history
+```
+
+V2 accepts the V1 strategy and market options except `--n-candles`; it always
+uses the fixed 2,000 closed-candle acquisition window. Its default database is
+`scanner_v2.db`, and default logs are `logs/v2_YYYYmmdd_HHMMSS.log`.
+For a long custom interval, that fixed window can be too short for the chosen
+forward window; V2 reports `INSUFFICIENT_HISTORY` instead of scoring partial data.
+
+The dashboard reads machine-readable `V2_RESULT` records. Each includes
+active/inactive signal state, opportunity/win/loss/timeout counts, baseline
+and selected TP rates, target source, resistance evidence, and quantized order
+levels. V2 shows R:R to both the stop trigger and stop limit; it does not show
+an EV estimate.
+
 ## Log dashboard — `log_dashboard.py`
 
 ```powershell
@@ -109,9 +139,12 @@ across reloads and applies to both tabs.
 | `/help` | Renders `help.md` (this file) as formatted markdown |
 | `/status` | DB size, log count, current running job |
 | `/logs` | Table of recent log files |
-| `/scan [args]` | Runs `binance_scanner_v1.py` with the given args (e.g. `/scan --max-scan 3`); no args = full scan |
-| `/proto` | Runs `binance_scanner_proto.py` |
-| `/history` | Prints past runs from the DB |
+| `/scan -v 1 [args]` | Runs V1 with the given args (e.g. `/scan -v 1 --max-scan 3`) |
+| `/scan -v 2 [args]` | Runs the adaptive V2 scanner |
+| `/scan -v p` | Runs the prototype; it accepts no scanner arguments |
+| `/history -v 1 [args]` | Prints V1 history; pass `--db PATH` when needed |
+| `/history -v 2 [args]` | Prints V2 history; pass `--db PATH` when needed |
+| `/proto` | Retired; use `/scan -v p` |
 | `/clear` | Clears the notebook transcript |
 
 | Endpoint | Description |
@@ -119,19 +152,21 @@ across reloads and applies to both tabs.
 | `GET /` | Dashboard HTML page |
 | `GET /api/logs` | JSON list of log files (name, size, mtime) |
 | `GET /api/log?name=X&page=N&page_size=M&q=text` | Paginated lines, optional text filter (page_size ≤ 2000) |
-| `POST /api/run` | Run a notebook command: `{"command": "/scan --max-scan 3"}` |
+| `POST /api/run` | Run a notebook command: `{"command": "/scan -v 2 --max-scan 3"}` |
 | `GET /api/run?job=ID&after=N` | Poll a running job — new lines since `after`, plus `running`/`finished`/`exit_code` |
 
 ## Logs
 
-- Both scanners write always-on UTF-8 logs to `logs/` (`*.log`, gitignored).
+- All scanners write always-on UTF-8 logs to `logs/` (`*.log`, gitignored).
 - V1 lines are prefixed `[YYYY-mm-dd HH:MM:SS]`; console colors are stripped in the file.
 - Proto log lines: lines that already start with `[HH:MM:SS]` (the verbose logger) are written as-is; every other line gets a full `[YYYY-mm-dd HH:MM:SS]` prefix. ANSI colors are stripped from all file lines.
+- V2 writes one `V2_RESULT` JSON record per evaluated pair so dashboard result
+  parsing does not depend on console wording.
 
 ## Notes
 
 - `--history` renders incomplete runs as `INCOMPLETE` and skips them from the summary.
-- `--interval`/ranges are validated up front — invalid values exit with a usage error listing the allowed choices.
+- `--interval`/ranges are validated up front — invalid values exit with a usage error.
 - Scans are rate-limit-safe (sleep between calls); a full 200-pair proto run takes several minutes by design.
 - Stop the dashboard with `Ctrl+C`.
 

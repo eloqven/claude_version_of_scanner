@@ -4,7 +4,7 @@ A Python research scanner for Binance Spot markets. It filters USDT and USDC
 pairs, backtests an RSI/ATR strategy, validates candidate order values against
 live Binance symbol filters, and records detailed results for later review.
 
-The project includes two scanner entry points and a local dashboard for
+The project includes three scanner entry points and a local dashboard for
 browsing logs, comparing candidates, and launching supervised scans.
 
 > [!IMPORTANT]
@@ -22,6 +22,8 @@ browsing logs, comparing candidates, and launching supervised scans.
 - Validates prices, quantities, notional values, percent-price bounds, tick
   sizes, and lot sizes before reporting an order layout.
 - Writes timestamped UTF-8 logs; V1 also stores run history in SQLite.
+- Adds V2 adaptive TP research: fixed closed-candle opportunity sets, timeout
+  accounting, resistance targets, ATR fallback, and explicit IN_SAMPLE output.
 - Provides a loopback-only dashboard with search, pagination, candidate tables,
   two colour schemes, and a notebook-style command panel.
 - Includes deterministic tests with mocked network access.
@@ -45,6 +47,9 @@ python -m pip install --upgrade pip
 python -m pip install requests numpy pandas
 
 python binance_scanner_v1.py --max-scan 3
+
+# V2 uses four closed 500-candle pages and writes scanner_v2.db
+python binance_scanner_v2.py --max-scan 3
 ```
 
 Run a full V1 scan with the defaults:
@@ -64,10 +69,12 @@ python binance_scanner_v1.py --history
 | Entry point | Purpose | Output |
 |---|---|---|
 | `binance_scanner_v1.py` | Configurable scanner with CLI validation and persistent history | Console, timestamped log, SQLite |
+| `binance_scanner_v2.py` | Adaptive TP research scanner with source-independent strategy logic | Console, `V2_RESULT` log records, `scanner_v2.db` |
 | `binance_scanner_proto.py` | Simpler constant-driven scanner for experimentation | Console, timestamped log, Markdown results |
 
-Both scanners share the same Binance filter parser and order-validation rules.
-See [help.md](help.md) for the complete command reference and every V1 option.
+V2 uses `LOT_SIZE` for its limit entry and sell OCO layout, and validates the
+buy and sell percent-price rules separately. V1 and prototype behavior stays
+unchanged. See [help.md](help.md) for the complete command reference.
 
 ## Local dashboard
 
@@ -84,7 +91,7 @@ binds only to loopback. It can:
 - paginate and filter log lines;
 - display sortable candidate results;
 - switch between Classic and Ocean palettes;
-- run `/scan`, `/proto`, `/history`, `/logs`, and `/status` commands;
+- run `/scan -v 1|2|p`, `/history -v 1|2`, `/logs`, and `/status` commands;
 - stream one background scanner job at a time.
 
 Use a different port or log directory when needed:
@@ -106,6 +113,12 @@ python log_dashboard.py --port 9000 --logdir logs
 5. Report only candidates whose win rate and generated order layout pass the
    configured strategy checks and supported parsed symbol constraints.
 
+V2 fetches four paginated 500-candle pages beneath a Binance server-time
+cutoff. It freezes non-overlapping historical opportunities, includes
+timeouts in TP hit rate, and never silently relaxes the configured upper rate.
+If a long custom interval leaves too little history for the forward window, it
+reports `INSUFFICIENT_HISTORY` rather than scoring a partial sample.
+
 The generated order layout is informational. No order-placement endpoint is
 called.
 
@@ -121,7 +134,7 @@ The following runtime files stay local and are ignored by Git:
 ## Tests
 
 ```powershell
-python -m py_compile scanner_common.py binance_scanner_v1.py binance_scanner_proto.py log_dashboard.py
+python -m py_compile scanner_common.py binance_scanner_v1.py binance_scanner_proto.py binance_scanner_v2.py log_dashboard.py scanner_v2/*.py
 python -m unittest discover -s tests
 ```
 
@@ -142,8 +155,10 @@ network access or modify live Binance state.
 
 ```text
 binance_scanner_v1.py       Configurable scanner and SQLite history
+binance_scanner_v2.py       Adaptive TP scanner and V2 SQLite history
 binance_scanner_proto.py    Constant-driven prototype scanner
 scanner_common.py           Shared exchange-filter and log-path helpers
+scanner_v2/                 Source, indicator, strategy, order, and store package
 log_dashboard.py            Loopback-only log and notebook dashboard
 help.md                     Full command reference
 tests/test_scanners.py      Scanner and dashboard test suite
