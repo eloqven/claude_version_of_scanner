@@ -12,6 +12,7 @@ import json
 import math
 import os
 from pathlib import Path
+import sys
 import time
 from typing import Any, Dict, List, Optional
 
@@ -36,6 +37,21 @@ from scanner_v2 import (
     interval_to_us,
     resample_candles,
 )
+
+
+def _setup_console() -> None:
+    """Force UTF-8 output with replacement fallback (Windows cp1252 safety)."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
+_setup_console()
 
 
 _NATIVE_INTERVALS = {

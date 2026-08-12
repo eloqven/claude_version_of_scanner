@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import binance_scanner_proto as proto
 import binance_scanner_v1 as v1
+import binance_scanner_v2 as v2
 import log_dashboard as dash
 
 
@@ -114,6 +115,10 @@ class TestConsoleEncoding(unittest.TestCase):
 
     def test_v1_reconfigures_console(self):
         data = self._simulate_cp1252(v1)
+        self.assertIn(b"TEST", data)
+
+    def test_v2_reconfigures_console(self):
+        data = self._simulate_cp1252(v2)
         self.assertIn(b"TEST", data)
 
 

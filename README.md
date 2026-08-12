@@ -134,7 +134,8 @@ The following runtime files stay local and are ignored by Git:
 ## Tests
 
 ```powershell
-python -m py_compile scanner_common.py binance_scanner_v1.py binance_scanner_proto.py binance_scanner_v2.py log_dashboard.py scanner_v2/*.py
+python -m py_compile scanner_common.py binance_scanner_v1.py binance_scanner_proto.py binance_scanner_v2.py log_dashboard.py
+python -m compileall -q scanner_v2
 python -m unittest discover -s tests
 ```
 
