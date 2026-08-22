@@ -13,6 +13,14 @@ python -m unittest discover -s tests
 
 All tests are deterministic and mocked — no network access.
 
+### Maintainer check shortcuts
+
+- Docs only: review the diff and run `git diff --check`.
+- Scanner code: run the compile commands above and the relevant unit tests.
+- V2 or dashboard behavior/output claims: also run
+  `python binance_scanner_v2.py --max-scan 3`.
+- Do not claim "current candidates" without a fresh scan and its log path.
+
 ## V1 scanner — `binance_scanner_v1.py`
 
 ```powershell

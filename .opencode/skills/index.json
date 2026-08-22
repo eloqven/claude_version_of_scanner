@@ -1,0 +1,238 @@
+{
+  "name": "compound-engineering-skills",
+  "version": "1.0.0",
+  "description": "Native opencode implementations of Compound Engineering skills",
+  "skills": [
+    {
+      "name": "ce-brainstorm",
+      "command": "/ce-brainstorm",
+      "file": "ce-brainstorm/SKILL.md",
+      "enabled": true,
+      "category": "core"
+    },
+    {
+      "name": "ce-plan",
+      "command": "/ce-plan",
+      "file": "ce-plan/SKILL.md",
+      "enabled": true,
+      "category": "core"
+    },
+    {
+      "name": "ce-work",
+      "command": "/ce-work",
+      "file": "ce-work/SKILL.md",
+      "enabled": true,
+      "category": "core"
+    },
+    {
+      "name": "ce-simplify-code",
+      "command": "/ce-simplify-code",
+      "file": "ce-simplify-code/SKILL.md",
+      "enabled": true,
+      "category": "core"
+    },
+    {
+      "name": "ce-code-review",
+      "command": "/ce-code-review",
+      "file": "ce-code-review/SKILL.md",
+      "enabled": true,
+      "category": "core"
+    },
+    {
+      "name": "ce-compound",
+      "command": "/ce-compound",
+      "file": "ce-compound/SKILL.md",
+      "enabled": true,
+      "category": "core"
+    },
+    {
+      "name": "ce-strategy",
+      "command": "/ce-strategy",
+      "file": "ce-strategy/SKILL.md",
+      "enabled": true,
+      "category": "around-the-loop"
+    },
+    {
+      "name": "ce-product-pulse",
+      "command": "/ce-product-pulse",
+      "file": "ce-product-pulse/SKILL.md",
+      "enabled": true,
+      "category": "around-the-loop"
+    },
+    {
+      "name": "ce-sweep",
+      "command": "/ce-sweep",
+      "file": "ce-sweep/SKILL.md",
+      "enabled": true,
+      "category": "around-the-loop"
+    },
+    {
+      "name": "ce-compound-refresh",
+      "command": "/ce-compound-refresh",
+      "file": "ce-compound-refresh/SKILL.md",
+      "enabled": true,
+      "category": "around-the-loop"
+    },
+    {
+      "name": "ce-ideate",
+      "command": "/ce-ideate",
+      "file": "ce-ideate/SKILL.md",
+      "enabled": true,
+      "category": "on-demand"
+    },
+    {
+      "name": "ce-pov",
+      "command": "/ce-pov",
+      "file": "ce-pov/SKILL.md",
+      "enabled": true,
+      "category": "on-demand"
+    },
+    {
+      "name": "ce-explain",
+      "command": "/ce-explain",
+      "file": "ce-explain/SKILL.md",
+      "enabled": true,
+      "category": "on-demand"
+    },
+    {
+      "name": "ce-prototype",
+      "command": "/ce-prototype",
+      "file": "ce-prototype/SKILL.md",
+      "enabled": true,
+      "category": "on-demand"
+    },
+    {
+      "name": "ce-debug",
+      "command": "/ce-debug",
+      "file": "ce-debug/SKILL.md",
+      "enabled": true,
+      "category": "on-demand"
+    },
+    {
+      "name": "ce-riffrec-feedback-analysis",
+      "command": "/ce-riffrec-feedback-analysis",
+      "file": "ce-riffrec-feedback-analysis/SKILL.md",
+      "enabled": true,
+      "category": "research"
+    },
+    {
+      "name": "ce-commit",
+      "command": "/ce-commit",
+      "file": "ce-commit/SKILL.md",
+      "enabled": true,
+      "category": "git-workflow"
+    },
+    {
+      "name": "ce-commit-push-pr",
+      "command": "/ce-commit-push-pr",
+      "file": "ce-commit-push-pr/SKILL.md",
+      "enabled": true,
+      "category": "git-workflow"
+    },
+    {
+      "name": "ce-babysit-pr",
+      "command": "/ce-babysit-pr",
+      "file": "ce-babysit-pr/SKILL.md",
+      "enabled": true,
+      "category": "git-workflow"
+    },
+    {
+      "name": "ce-worktree",
+      "command": "/ce-worktree",
+      "file": "ce-worktree/SKILL.md",
+      "enabled": true,
+      "category": "git-workflow"
+    },
+    {
+      "name": "lfg",
+      "command": "/lfg",
+      "file": "lfg/SKILL.md",
+      "enabled": true,
+      "category": "autonomous"
+    },
+    {
+      "name": "ce-polish",
+      "command": "/ce-polish",
+      "file": "ce-polish/SKILL.md",
+      "enabled": true,
+      "category": "frontend-design"
+    },
+    {
+      "name": "ce-promote",
+      "command": "/ce-promote",
+      "file": "ce-promote/SKILL.md",
+      "enabled": true,
+      "category": "frontend-design"
+    },
+    {
+      "name": "ce-proof",
+      "command": "/ce-proof",
+      "file": "ce-proof/SKILL.md",
+      "enabled": true,
+      "category": "collaboration"
+    },
+    {
+      "name": "ce-test-browser",
+      "command": "/ce-test-browser",
+      "file": "ce-test-browser/SKILL.md",
+      "enabled": true,
+      "category": "collaboration"
+    },
+    {
+      "name": "ce-test-xcode",
+      "command": "/ce-test-xcode",
+      "file": "ce-test-xcode/SKILL.md",
+      "enabled": true,
+      "category": "collaboration"
+    },
+    {
+      "name": "ce-setup",
+      "command": "/ce-setup",
+      "file": "ce-setup/SKILL.md",
+      "enabled": true,
+      "category": "setup"
+    },
+    {
+      "name": "ce-handoff",
+      "command": "/ce-handoff",
+      "file": "ce-handoff/SKILL.md",
+      "enabled": true,
+      "category": "setup"
+    },
+    {
+      "name": "ce-optimize",
+      "command": "/ce-optimize",
+      "file": "ce-optimize/SKILL.md",
+      "enabled": true,
+      "category": "optimization"
+    },
+    {
+      "name": "ce-retune",
+      "command": "/ce-retune",
+      "file": "ce-retune/SKILL.md",
+      "enabled": true,
+      "category": "optimization"
+    },
+    {
+      "name": "ce-doc-review",
+      "command": "/ce-doc-review",
+      "file": "ce-doc-review/SKILL.md",
+      "enabled": true,
+      "category": "quality"
+    },
+    {
+      "name": "ce-resolve-pr-feedback",
+      "command": "/ce-resolve-pr-feedback",
+      "file": "ce-resolve-pr-feedback/SKILL.md",
+      "enabled": true,
+      "category": "quality"
+    },
+    {
+      "name": "ce-dogfood",
+      "command": "/ce-dogfood",
+      "file": "ce-dogfood/SKILL.md",
+      "enabled": true,
+      "category": "quality"
+    }
+  ]
+}

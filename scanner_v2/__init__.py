@@ -30,6 +30,28 @@ from .strategy import (
     score_multiplier,
     select_hardest_passing,
 )
+from .archive import (
+    ArchiveCandleSource,
+    ArchiveFile,
+    ArchiveMetadataStore,
+    build_archive_url,
+    build_local_path,
+    detect_timestamp_unit,
+    parse_checksum_file,
+    parse_kline_csv,
+    validate_candles,
+)
+from .fib_matrix import (
+    ConfluenceZone,
+    EventType,
+    FibMatrix,
+    MatrixElement,
+    ReactionMetrics,
+    V3Event,
+    V3EventStore,
+    log_event_json,
+    log_summary_json,
+)
 
 __all__ = [
     "AdaptiveConfig", "AdaptiveStrategy", "BookQuote", "Candle", "CandleBatch", "CandleIntegrityError", "CandleQuery",
@@ -38,4 +60,10 @@ __all__ = [
     "Opportunity", "OrderLevels", "PairEvaluation", "ResistanceEvidence", "ScanStore", "SourceError",
     "StrategyTrace", "TargetScore", "fallback_multipliers", "freeze_opportunities",
     "build_order", "floor_tick", "resistance_candidates", "resample_candles", "score_multiplier", "select_hardest_passing",
+    "ArchiveCandleSource", "ArchiveFile", "ArchiveMetadataStore",
+    "build_archive_url", "build_local_path", "detect_timestamp_unit",
+    "parse_checksum_file", "parse_kline_csv", "validate_candles",
+    "ConfluenceZone", "EventType", "FibMatrix", "MatrixElement",
+    "ReactionMetrics", "V3Event", "V3EventStore",
+    "log_event_json", "log_summary_json",
 ]

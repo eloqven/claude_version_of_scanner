@@ -142,6 +142,22 @@ python -m unittest discover -s tests
 The unit suite uses mocks and temporary directories, so it does not require
 network access or modify live Binance state.
 
+## Maintainer / agent workflow
+
+- Define the affected surface first: V1, V2, proto, dashboard, docs, or
+  generated data.
+- Gather only evidence that can change the decision: use `rg`, read the exact
+  current code or documentation, and inspect targeted logs or tests.
+- Refresh live scan evidence before making claims about current candidates or
+  results.
+- Keep scope tight: avoid unrelated refactors, do not add documentation unless
+  requested, and never commit runtime artifacts.
+- Match validation to risk: review the diff for documentation-only changes;
+  run targeted tests for localized code; run the full suite and a smoke scan
+  for scanner or dashboard behavior changes.
+- Report changed files, commands run, pass/fail results, and remaining
+  unknowns.
+
 ## Safety notes
 
 - The scanners make unauthenticated requests to Binance public endpoints.
