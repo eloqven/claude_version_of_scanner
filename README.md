@@ -71,6 +71,8 @@ python binance_scanner_v1.py --history
 | `binance_scanner_v1.py` | Configurable scanner with CLI validation and persistent history | Console, timestamped log, SQLite |
 | `binance_scanner_v2.py` | Adaptive TP research scanner with source-independent strategy logic | Console, `V2_RESULT` log records, `scanner_v2.db` |
 | `binance_scanner_proto.py` | Simpler constant-driven scanner for experimentation | Console, timestamped log, Markdown results |
+| `binance_1s_scraper.py` | Binance Spot 1s archive downloader/validator | Raw ZIPs, SQLite metadata (`scanner_archive.db`) |
+| `binance_scanner_v3.py` | Fib Matrix V3 research engine (archive-backed) | `V3_EVENT`/`V3_SUMMARY` logs, `fib_matrix_v3.db` |
 
 V2 uses `LOT_SIZE` for its limit entry and sell OCO layout, and validates the
 buy and sell percent-price rules separately. V1 and prototype behavior stays
@@ -122,6 +124,44 @@ reports `INSUFFICIENT_HISTORY` rather than scoring a partial sample.
 The generated order layout is informational. No order-placement endpoint is
 called.
 
+## 1-second archive scraper
+
+`binance_1s_scraper.py` downloads and validates Binance Spot 1s klines from
+`data.binance.vision` (raw ZIPs preserved locally with checksum verification and
+SQLite metadata). It is the data source for the V3 research engine.
+
+```powershell
+# Dry run: show what would be downloaded, no network writes
+python binance_1s_scraper.py --symbols BTCUSDT,EIGENUSDC --start 2026-08-10 --end 2026-08-12 --dry-run
+
+# Real download + validate
+python binance_1s_scraper.py --symbols BTCUSDT --start 2026-08-10 --end 2026-08-12
+
+# Re-verify existing files' checksums without re-downloading
+python binance_1s_scraper.py --symbols BTCUSDT --start 2026-08-10 --end 2026-08-12 --verify-only
+```
+
+Raw files land under `data/binance_1s/raw/spot/daily/klines/{SYMBOL}/1s/`.
+Metadata, including per-file checksum and row/gap/duplicate status, is stored in
+`scanner_archive.db` (both gitignored). Files dated `>= 2025-01-01` use
+microsecond timestamps; older Spot files use milliseconds.
+
+## Fib Matrix V3 research engine
+
+`binance_scanner_v3.py` reads only validated 1s archive data (use
+`--bootstrap-missing` to download first) and builds Fibonacci interval × period
+MA matrices, clusters confluence zones, and records reaction events. It is
+research-only: no order/OCO output and no execution-readiness claim.
+
+```powershell
+python binance_scanner_v3.py --symbols EIGENUSDC --start 2026-08-10 --end 2026-08-12
+```
+
+Events (support/resistance rejection, break up/down, touch only) are stored in
+`fib_matrix_v3.db` and emitted as machine-readable `V3_EVENT` / `V3_SUMMARY`
+JSON lines.
+
+
 ## Generated data
 
 The following runtime files stay local and are ignored by Git:
@@ -134,7 +174,7 @@ The following runtime files stay local and are ignored by Git:
 ## Tests
 
 ```powershell
-python -m py_compile scanner_common.py binance_scanner_v1.py binance_scanner_proto.py binance_scanner_v2.py log_dashboard.py
+python -m py_compile scanner_common.py binance_scanner_v1.py binance_scanner_proto.py binance_scanner_v2.py binance_1s_scraper.py binance_scanner_v3.py log_dashboard.py
 python -m compileall -q scanner_v2
 python -m unittest discover -s tests
 ```
@@ -174,6 +214,8 @@ network access or modify live Binance state.
 binance_scanner_v1.py       Configurable scanner and SQLite history
 binance_scanner_v2.py       Adaptive TP scanner and V2 SQLite history
 binance_scanner_proto.py    Constant-driven prototype scanner
+binance_1s_scraper.py       Binance Spot 1s archive downloader/validator
+binance_scanner_v3.py       Fib Matrix V3 research engine (archive-backed)
 scanner_common.py           Shared exchange-filter and log-path helpers
 scanner_v2/                 Source, indicator, strategy, order, and store package
 log_dashboard.py            Loopback-only log and notebook dashboard

@@ -6,7 +6,7 @@ Requires `requests`, `numpy`, `pandas` (stdlib only otherwise). No API keys need
 ## Tests
 
 ```powershell
-python -m py_compile scanner_common.py binance_scanner_v1.py binance_scanner_proto.py binance_scanner_v2.py log_dashboard.py
+python -m py_compile scanner_common.py binance_scanner_v1.py binance_scanner_proto.py binance_scanner_v2.py binance_1s_scraper.py binance_scanner_v3.py log_dashboard.py
 python -m compileall -q scanner_v2
 python -m unittest discover -s tests
 ```
@@ -117,6 +117,68 @@ active/inactive signal state, opportunity/win/loss/timeout counts, baseline
 and selected TP rates, target source, resistance evidence, and quantized order
 levels. V2 shows R:R to both the stop trigger and stop limit; it does not show
 an EV estimate.
+
+## 1s archive scraper — `binance_1s_scraper.py`
+
+Downloads and validates Binance Spot 1-second klines from `data.binance.vision`.
+Raw ZIPs are preserved locally (under `data/binance_1s/raw/...`, gitignored) and
+each file's checksum, row count, gaps, and duplicates are recorded in
+`scanner_archive.db`. This is the data layer for V3.
+
+```powershell
+# Preview what would be downloaded (no network writes)
+python binance_1s_scraper.py --symbols BTCUSDT,EIGENUSDC --start 2026-08-10 --end 2026-08-12 --dry-run
+
+# Download and validate
+python binance_1s_scraper.py --symbols BTCUSDT --start 2026-08-10 --end 2026-08-12
+
+# Re-check checksums of already-downloaded files
+python binance_1s_scraper.py --symbols BTCUSDT --start 2026-08-10 --end 2026-08-12 --verify-only
+```
+
+Timestamps are taken from the file date, never inferred from magnitude:
+files `>= 2025-01-01` use microseconds, older Spot files use milliseconds.
+The metadata store is consulted first, so already-validated files are skipped
+unless `--force` is passed.
+
+| Option | Default | Description |
+|---|---|---|
+| `--symbols S` | — | Comma-separated symbols (required) |
+| `--start DATE` | — | Start date `YYYY-MM-DD` (required) |
+| `--end DATE` | — | End date `YYYY-MM-DD` (required) |
+| `--archive-dir DIR` | `data/binance_1s` | Raw archive root |
+| `--db DB` | `scanner_archive.db` | Metadata SQLite path |
+| `--force` | — | Re-download and re-validate even if validated |
+| `--verify-only` | — | Only verify checksums, no parse/validate |
+| `--dry-run` | — | Print URLs that would be fetched; no downloads |
+| `--max-retries N` | `3` | Download retries per file |
+
+## V3 research engine — `binance_scanner_v3.py`
+
+Reads validated 1s archive data (pass `--bootstrap-missing` to scrape missing
+days first) and runs the Fibonacci Matrix research pipeline: it builds a
+Fibonacci interval × period MA matrix, clusters confluence zones (scaled by 1m
+ATR), detects support/resistance rejections and breaks, and records reaction
+events into `fib_matrix_v3.db`. Research-only — no orders, OCO levels, or
+execution-readiness claims.
+
+```powershell
+python binance_scanner_v3.py --symbols EIGENUSDC --start 2026-08-10 --end 2026-08-12
+```
+
+Each event is logged as a machine-readable `V3_EVENT` JSON line; a `V3_SUMMARY`
+line closes the run.
+
+| Option | Default | Description |
+|---|---|---|
+| `--symbols S` | — | Comma-separated symbols (required) |
+| `--start DATE` | — | Start date `YYYY-MM-DD` (required) |
+| `--end DATE` | — | End date `YYYY-MM-DD` (required) |
+| `--archive-dir DIR` | `data/binance_1s` | Archive root for `ArchiveCandleSource` |
+| `--archive-db DB` | `scanner_archive.db` | Archive metadata DB |
+| `--event-db DB` | `fib_matrix_v3.db` | Event output SQLite path |
+| `--bootstrap-missing` | — | Download missing archive days before analysis |
+
 
 ## Log dashboard — `log_dashboard.py`
 

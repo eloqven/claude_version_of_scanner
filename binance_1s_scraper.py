@@ -252,10 +252,22 @@ def main() -> int:
     for symbol in symbols:
         print(f"=== {symbol} ===")
         for date in dates:
+            if args.dry_run:
+                # Dry-run is informational only: never retry and never count
+                # the "would download" result as a failure.
+                result = _process_symbol_date(
+                    symbol, date, args.archive_dir, metadata_store,
+                    force=args.force, verify_only=args.verify_only, dry_run=True,
+                )
+                if result is not None:
+                    total_files += 1
+                    if result.validated:
+                        total_validated += 1
+                continue
             for attempt in range(args.max_retries):
                 result = _process_symbol_date(
                     symbol, date, args.archive_dir, metadata_store,
-                    force=args.force, verify_only=args.verify_only, dry_run=args.dry_run,
+                    force=args.force, verify_only=args.verify_only,
                 )
                 if result is not None:
                     total_files += 1
