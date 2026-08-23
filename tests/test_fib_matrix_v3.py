@@ -30,7 +30,7 @@ from scanner_v2.fib_matrix import (
     MIN_CLUSTER_MEMBERS,
 )
 from scanner_v2.archive import ArchiveCandleSource
-from scanner_v2.models import Candle, CandleBatch, CandleQuery
+from scanner_v2.models import Candle, CandleBatch, CandleQuery, interval_to_us
 
 
 def make_candle(index: int, *, interval_us: int = 60_000_000,
@@ -249,7 +249,7 @@ class TestEventDetection(unittest.TestCase):
     def test_detect_events_empty_zones(self):
         """Test event detection with no zones."""
         candles = [make_candle(i) for i in range(10)]
-        events = self.matrix.detect_events([], candles)
+        events = self.matrix.detect_events([], candles, "TEST")
         self.assertEqual(len(events), 0)
 
     def test_detect_events_no_touch(self):
@@ -260,7 +260,7 @@ class TestEventDetection(unittest.TestCase):
             period_diversity=1, ma_type_diversity=2,
         )
         candles = [make_candle(i) for i in range(10)]  # All around 100
-        events = self.matrix.detect_events([zone], candles)
+        events = self.matrix.detect_events([zone], candles, "TEST")
         self.assertEqual(len(events), 0)
 
     def test_detect_events_support_rejection(self):
@@ -275,7 +275,7 @@ class TestEventDetection(unittest.TestCase):
             make_candle(0, open_="99.5", low="98.0", high="99.5", close="99.5"),
             make_candle(1, open_="99.5", low="99.0", high="100.5", close="100.5"),
         ]
-        events = self.matrix.detect_events([zone], candles)
+        events = self.matrix.detect_events([zone], candles, "TEST")
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].event_type, EventType.SUPPORT_REJECTION)
 
@@ -431,6 +431,133 @@ class TestDeterministicFixture(unittest.TestCase):
         ]
         zones = matrix.cluster_zones(elements, Decimal("1.0"))
         self.assertEqual(len(zones), 0)
+
+
+def make_1s_day_batch(minutes: int = 120, day_start_us: int = 0) -> CandleBatch:
+    """Build a day-aligned 1s CandleBatch for resample integration tests."""
+    from scanner_v2.models import interval_to_us
+    interval_us = interval_to_us("1s")
+    candles = [
+        Candle(
+            open_time_us=day_start_us + i * interval_us,
+            close_time_us=day_start_us + i * interval_us + interval_us - 1,
+            open=Decimal("100"),
+            high=Decimal("101"),
+            low=Decimal("99"),
+            close=Decimal("100.5"),
+            volume=Decimal("1000"),
+            trade_count=10,
+        )
+        for i in range(minutes * 60)
+    ]
+    return CandleBatch(
+        symbol="TEST",
+        interval="1s",
+        candles=candles,
+        source="test",
+        timestamp_unit="us",
+        cutoff_us=day_start_us + minutes * 60 * interval_us,
+    )
+
+
+def make_resampled_batch(interval: str, count: int) -> CandleBatch:
+    """Build a resampled CandleBatch (already at the fib interval) for tests."""
+    from scanner_v2.models import interval_to_us
+    interval_us = interval_to_us(interval)
+    candles = []
+    for i in range(count):
+        open_us = i * interval_us
+        close = Decimal(str(100 + i * 0.01))
+        candles.append(Candle(
+            open_time_us=open_us,
+            close_time_us=open_us + interval_us - 1,
+            open=close,
+            high=close + Decimal("1"),
+            low=close - Decimal("1"),
+            close=close,
+            volume=Decimal("1000"),
+            trade_count=10,
+        ))
+    return CandleBatch(
+        symbol="TEST",
+        interval=interval,
+        candles=candles,
+        source="test:resampled",
+        timestamp_unit="us",
+        cutoff_us=count * interval_us,
+    )
+
+
+class TestBuildMatrixIntegration(unittest.TestCase):
+    """Integration tests for build_matrix source->resample->matrix path."""
+
+    def test_build_matrix_from_1s_source_returns_elements(self):
+        """build_matrix must no longer be a silent no-op over a 1s archive.
+
+        Regression test for the CRITICAL review finding: a real 1s
+        ArchiveCandleSource must yield matrix elements (previously every
+        interval raised ValueError and was swallowed, producing []).
+        """
+        batch = make_1s_day_batch(minutes=120)
+        mock_source = mock.MagicMock(spec=ArchiveCandleSource)
+        mock_source.fetch.return_value = batch
+
+        matrix = FibMatrix(mock_source)
+        timestamp_us = 120 * 60 * 1_000_000
+        elements = matrix.build_matrix("BTCUSDT", timestamp_us)
+
+        self.assertGreater(len(elements), 0)
+        self.assertTrue(any(e.interval == "5m" for e in elements))
+        # Verify the values are real MAs, not zeros.
+        self.assertTrue(all(e.value > 0 for e in elements))
+
+    def test_build_matrix_resampled_dict_returns_108(self):
+        """A precomputed resample mapping yields the full 108-element matrix."""
+        resampled_by_interval = {iv: make_resampled_batch(iv, 60) for iv in FIB_INTERVALS}
+        matrix = FibMatrix(mock.MagicMock(spec=ArchiveCandleSource))
+        timestamp_us = 60 * interval_to_us("55m")
+        elements = matrix.build_matrix("BTCUSDT", timestamp_us,
+                                       resampled_by_interval=resampled_by_interval)
+        self.assertEqual(len(elements), 108)
+
+    def test_end_to_end_symbol_threaded_through_event(self):
+        """build_matrix -> detect_events -> record_event stores the real symbol.
+
+        Regression test for the HIGH review finding: the event symbol used to
+        be set to an interval string instead of the trading symbol.
+        """
+        resampled_by_interval = {iv: make_resampled_batch(iv, 60) for iv in FIB_INTERVALS}
+        matrix = FibMatrix(mock.MagicMock(spec=ArchiveCandleSource))
+        timestamp_us = 60 * interval_to_us("55m")
+        elements = matrix.build_matrix("BTCUSDT", timestamp_us,
+                                       resampled_by_interval=resampled_by_interval)
+        self.assertGreater(len(elements), 0)
+
+        atr = Decimal("1000")
+        zones = matrix.cluster_zones(elements, atr)
+        self.assertGreater(len(zones), 0)
+
+        # Candles that touch the zone so an event is emitted.
+        candles = [
+            make_candle(0, open_="100.0", low="99.0", high="101.0", close="100.5"),
+            make_candle(1, open_="100.5", low="100.0", high="101.5", close="101.0"),
+        ]
+        events = matrix.detect_events(zones, candles, "BTCUSDT")
+        self.assertGreater(len(events), 0)
+        self.assertEqual(events[0].symbol, "BTCUSDT")
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            store = V3EventStore(os.path.join(tmpdir, "e2e.db"))
+            event_id = store.record_event(events[0])
+            row = store.connection.execute(
+                "SELECT symbol FROM v3_events WHERE id=?", (event_id,)
+            ).fetchone()
+            store.close()
+            self.assertEqual(row[0], "BTCUSDT")
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir)
 
 
 if __name__ == "__main__":

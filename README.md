@@ -161,6 +161,11 @@ Events (support/resistance rejection, break up/down, touch only) are stored in
 `fib_matrix_v3.db` and emitted as machine-readable `V3_EVENT` / `V3_SUMMARY`
 JSON lines.
 
+> The engine resamples a 1s archive source to each Fibonacci interval
+> (`5m,8m,13m,21m,34m,55m`) per evaluation. End-to-end event emission requires
+> validated 1s archive data for the requested symbol/date range (the
+> `build_matrix` source→resample path).
+
 
 ## Generated data
 

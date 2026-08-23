@@ -134,8 +134,7 @@ def build_archive_url(symbol: str, date: str) -> Tuple[str, str]:
 
     Returns (zip_url, checksum_url).
     """
-    date_obj = datetime.strptime(date, "%Y-%m-%d")
-    date_str = date_obj.strftime("%Y-%m-%d")
+    date_str = date
     zip_url = f"{ARCHIVE_BASE_URL}/{symbol}/1s/{symbol}-1s-{date_str}.zip"
     checksum_url = f"{ARCHIVE_BASE_URL}/{symbol}/1s/{symbol}-1s-{date_str}.CHECKSUM"
     return zip_url, checksum_url
@@ -146,8 +145,7 @@ def build_local_path(archive_dir: str, symbol: str, date: str) -> Tuple[str, str
 
     Returns (zip_path, checksum_path).
     """
-    date_obj = datetime.strptime(date, "%Y-%m-%d")
-    date_str = date_obj.strftime("%Y-%m-%d")
+    date_str = date
     base = Path(archive_dir) / "raw" / "spot" / "daily" / "klines" / symbol / "1s"
     base.mkdir(parents=True, exist_ok=True)
     zip_path = str(base / f"{symbol}-1s-{date_str}.zip")

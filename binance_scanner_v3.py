@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import pandas as pd
 
@@ -26,12 +26,13 @@ from scanner_v2.fib_matrix import (
     log_event_json,
     log_summary_json,
     EventType,
+    FIB_INTERVALS,
 )
+from scanner_v2.indicators import IndicatorEngine
 from scanner_v2.models import (
     Candle,
     CandleBatch,
     CandleQuery,
-    IndicatorEngine,
     IndicatorSpec,
     interval_to_us,
 )
@@ -61,9 +62,9 @@ def _date_range(start: str, end: str) -> List[str]:
     return dates
 
 
-def _get_1m_candles(archive_source: ArchiveCandleSource, symbol: str,
-                    start_us: int, end_us: int) -> List[Candle]:
-    """Get 1-minute candles by resampling 1s data."""
+def _get_1s_batch(archive_source: ArchiveCandleSource, symbol: str,
+                  start_us: int, end_us: int) -> Optional[CandleBatch]:
+    """Fetch the raw 1s candle batch for a date range from the archive."""
     query = CandleQuery(
         symbol=symbol,
         interval="1s",
@@ -74,17 +75,9 @@ def _get_1m_candles(archive_source: ArchiveCandleSource, symbol: str,
     )
 
     try:
-        batch = archive_source.fetch(query)
+        return archive_source.fetch(query)
     except Exception:
-        return []
-
-    # Resample to 1-minute
-    from scanner_v2.sources import resample_candles
-    try:
-        resampled = resample_candles(batch, "1m")
-        return list(resampled.candles)
-    except Exception:
-        return []
+        return None
 
 
 def _compute_atr_1m(candles: List[Candle], period: int = 14) -> Decimal:
@@ -136,14 +129,25 @@ def run_v3_analysis(symbol: str, start_date: str, end_date: str,
 
         print(f"Processing {date}...")
 
-        # Get 1-minute candles for the day
-        candles_1m = _get_1m_candles(archive_source, symbol, day_start_us, day_end_us)
-        if not candles_1m:
+        # Fetch the full day's 1s batch once and resample locally (perf fix:
+        # avoids re-fetching and re-parsing the day for every 1m evaluation).
+        batch_1s = _get_1s_batch(archive_source, symbol, day_start_us, day_end_us)
+        if batch_1s is None:
             if bootstrap_missing:
                 print(f"  No archive data for {date}, skipping (bootstrap-missing)")
                 continue
             else:
                 print(f"  WARNING: No archive data for {date}", file=sys.stderr)
+                continue
+
+        from scanner_v2.sources import resample_candles
+
+        candles_1m = list(resample_candles(batch_1s, "1m").candles)
+        resampled_by_interval: Dict[str, CandleBatch] = {}
+        for interval in FIB_INTERVALS:
+            try:
+                resampled_by_interval[interval] = resample_candles(batch_1s, interval)
+            except Exception:
                 continue
 
         # Compute ATR for clustering scale
@@ -155,7 +159,8 @@ def run_v3_analysis(symbol: str, start_date: str, end_date: str,
             total_evaluations += 1
 
             # Build matrix at this timestamp
-            elements = fib_matrix.build_matrix(symbol, eval_time)
+            elements = fib_matrix.build_matrix(
+                symbol, eval_time, resampled_by_interval=resampled_by_interval)
             if not elements:
                 continue
 
@@ -165,7 +170,7 @@ def run_v3_analysis(symbol: str, start_date: str, end_date: str,
                 continue
 
             # Detect events
-            events = fib_matrix.detect_events(zones, candles_1m)
+            events = fib_matrix.detect_events(zones, candles_1m, symbol)
             for event in events:
                 event_store.record_event(event)
                 all_events.append(event)

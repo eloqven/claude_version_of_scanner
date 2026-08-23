@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -13,7 +13,14 @@ from pathlib import Path
 
 import pandas as pd
 
-from .models import Candle, CandleBatch, CandleQuery, IndicatorFrame, IndicatorSpec
+from .models import (
+    Candle,
+    CandleBatch,
+    CandleQuery,
+    IndicatorFrame,
+    IndicatorSpec,
+    interval_to_us,
+)
 from .archive import ArchiveCandleSource
 from .indicators import IndicatorEngine
 
@@ -89,31 +96,38 @@ class FibMatrix:
         self.indicator_engine = IndicatorEngine()
 
     def build_matrix(self, symbol: str, timestamp_us: int,
-                     lookback_candles: int = 100) -> List[MatrixElement]:
+                      lookback_candles: int = 100,
+                      resampled_by_interval: Optional[Dict[str, CandleBatch]] = None
+                      ) -> List[MatrixElement]:
         """Build the 108-element matrix at a given timestamp.
 
-        For each interval x MA type x period combination, compute the latest
-        closed value at the given timestamp.
+        The Fibonacci matrix resamples a 1s source to each fib interval and
+        computes the latest closed MA value at ``timestamp_us``.
+
+        ``resampled_by_interval`` is an optional precomputed mapping of
+        ``interval -> CandleBatch`` already resampled to that fib interval and
+        aligned to UTC epoch buckets. When omitted, ``build_matrix`` fetches the
+        day's 1s batch from the archive source and resamples it locally. Callers
+        that evaluate many timestamps within the same day should precompute and
+        pass this mapping to avoid re-fetching and re-resampling per evaluation.
         """
         elements: List[MatrixElement] = []
 
-        for interval in FIB_INTERVALS:
-            interval_us = self._interval_to_us(interval)
-            query = CandleQuery(
-                symbol=symbol,
-                interval=interval,
-                cutoff_us=timestamp_us,
-                start_us=timestamp_us - interval_us * lookback_candles,
-                end_us=timestamp_us,
-                limit=2000,
-            )
+        from scanner_v2.sources import resample_candles
 
-            try:
-                batch = self.archive_source.fetch(query)
-            except Exception:
-                continue
+        if resampled_by_interval is None:
+            batch_1s = self._fetch_day_1s(symbol, timestamp_us)
+            if batch_1s is None:
+                return elements
+            resampled_by_interval = {}
+            for interval in FIB_INTERVALS:
+                try:
+                    resampled_by_interval[interval] = resample_candles(batch_1s, interval)
+                except Exception:
+                    continue
 
-            candles = list(batch.candles)
+        for interval, resampled in resampled_by_interval.items():
+            candles = [c for c in resampled.candles if c.close_time_us < timestamp_us]
             if not candles:
                 continue
 
@@ -134,39 +148,68 @@ class FibMatrix:
 
         return elements
 
+    def _fetch_day_1s(self, symbol: str, timestamp_us: int) -> Optional[CandleBatch]:
+        """Fetch the 1s day batch containing ``timestamp_us`` from the archive."""
+        day_us = interval_to_us("1d")
+        day_start_us = timestamp_us - (timestamp_us % day_us)
+        query = CandleQuery(
+            symbol=symbol,
+            interval="1s",
+            cutoff_us=timestamp_us,
+            start_us=day_start_us,
+            end_us=day_start_us + day_us,
+            limit=2000,
+        )
+        try:
+            return self.archive_source.fetch(query)
+        except Exception:
+            return None
+
     def _interval_to_us(self, interval: str) -> int:
         """Convert interval string to microseconds."""
-        from scanner_v2.models import interval_to_us as _interval_to_us
-        return _interval_to_us(interval)
+        return interval_to_us(interval)
 
     def _compute_ma(self, candles: Sequence[Candle], ma_type: str, period: int) -> Optional[Decimal]:
-        """Compute a moving average of the specified type and period."""
+        """Compute a moving average of the specified type and period.
+
+        SMA and WMA are trailing-window averages over the last ``period``
+        closed candles. EMA is seeded with the SMA of the first ``period``
+        closes and then rolled forward over the full available series (standard
+        TA-Lib/TradingView semantics).
+        """
         if len(candles) < period:
             return None
 
-        closes = [c.close for c in candles[-period:]]
+        closes = [c.close for c in candles]
 
         if ma_type == "SMA":
-            return sum(closes, Decimal("0")) / Decimal(period)
+            window = closes[-period:]
+            return sum(window, Decimal("0")) / Decimal(period)
         elif ma_type == "EMA":
             return self._compute_ema(closes, period)
         elif ma_type == "WMA":
-            return self._compute_wma(closes, period)
+            window = closes[-period:]
+            return self._compute_wma(window, period)
         else:
             raise ValueError(f"Unknown MA type: {ma_type}")
 
     def _compute_ema(self, values: Sequence[Decimal], period: int) -> Decimal:
-        """Compute Exponential Moving Average."""
-        if not values:
-            return Decimal("0")
+        """Compute a standard Exponential Moving Average.
+
+        Seed with the SMA of the first ``period`` values, then roll the
+        recursion forward over the entire series.
+        """
+        if len(values) < period:
+            raise ValueError("EMA requires at least `period` values")
+        seed = sum(values[:period], Decimal("0")) / Decimal(period)
         multiplier = Decimal("2") / Decimal(period + 1)
-        ema = values[0]
-        for value in values[1:]:
+        ema = seed
+        for value in values[period:]:
             ema = (value - ema) * multiplier + ema
         return ema
 
     def _compute_wma(self, values: Sequence[Decimal], period: int) -> Decimal:
-        """Compute Weighted Moving Average."""
+        """Compute a weighted moving average over the trailing ``period`` values."""
         if not values:
             return Decimal("0")
         weights = list(range(1, len(values) + 1))
@@ -223,19 +266,20 @@ class FibMatrix:
         )
 
     def detect_events(self, zones: List[ConfluenceZone],
-                      candles: Sequence[Candle]) -> List[V3Event]:
+                      candles: Sequence[Candle], symbol: str) -> List[V3Event]:
         """Detect Fibonacci confluence events from zones and price action."""
         events: List[V3Event] = []
 
         for zone in zones:
-            event = self._classify_zone_event(zone, candles)
+            event = self._classify_zone_event(zone, candles, symbol)
             if event:
                 events.append(event)
 
         return events
 
     def _classify_zone_event(self, zone: ConfluenceZone,
-                             candles: Sequence[Candle]) -> Optional[V3Event]:
+                            candles: Sequence[Candle],
+                            symbol: str) -> Optional[V3Event]:
         """Classify a zone interaction as a specific event type."""
         zone_candles = [
             c for c in candles
@@ -268,7 +312,7 @@ class FibMatrix:
         return V3Event(
             event_type=event_type,
             timestamp_us=first_touch.open_time_us,
-            symbol=zone.members[0].interval if zone.members else "UNKNOWN",
+            symbol=symbol if symbol else (zone.members[0].interval if zone.members else "UNKNOWN"),
             zone=zone,
             reaction_metrics=reaction_metrics,
             matrix_elements=zone.members,
@@ -411,7 +455,7 @@ class V3EventStore:
             event.zone.period_diversity,
             event.zone.ma_type_diversity,
             json.dumps(reaction_data),
-            datetime.utcnow().isoformat(),
+            datetime.now(timezone.utc).isoformat(),
         ))
         self.connection.commit()
         return cursor.lastrowid

@@ -121,45 +121,48 @@ def _process_symbol_date(
             print(f"  {symbol} {date}: already validated, skipping")
             return existing
 
-    # Download checksum file
-    if not dry_run:
-        if not _download_file(checksum_url, checksum_path):
-            print(f"  {symbol} {date}: failed to download checksum", file=sys.stderr)
-            return None
+        # Download checksum file (optional). Binance daily klines publish the ZIP
+        # but do not always publish a .CHECKSUM, so proceed without verification
+        # when the checksum is unavailable.
+        if not dry_run:
+            expected_checksum = None
+            if _download_file(checksum_url, checksum_path):
+                try:
+                    with open(checksum_path, "r") as f:
+                        expected_checksum = parse_checksum_file(f.read())
+                except (ValueError, OSError):
+                    expected_checksum = None
+            else:
+                print(f"  {symbol} {date}: checksum unavailable, continuing without verification")
 
-        # Parse expected checksum
-        try:
-            with open(checksum_path, "r") as f:
-                expected_checksum = parse_checksum_file(f.read())
-        except (ValueError, OSError) as exc:
-            print(f"  {symbol} {date}: failed to parse checksum: {exc}", file=sys.stderr)
-            return None
-
-        if verify_only:
-            # Just verify checksum, don't download ZIP
-            if not _download_file(zip_url, zip_path):
-                print(f"  {symbol} {date}: failed to download ZIP for verification", file=sys.stderr)
+            if verify_only:
+                if expected_checksum is None:
+                    print(f"  {symbol} {date}: no checksum published to verify", file=sys.stderr)
+                    return None
+                # Just verify checksum, don't download ZIP
+                if not _download_file(zip_url, zip_path):
+                    print(f"  {symbol} {date}: failed to download ZIP for verification", file=sys.stderr)
+                    return None
+                if not _verify_checksum(zip_path, expected_checksum):
+                    print(f"  {symbol} {date}: CHECKSUM MISMATCH", file=sys.stderr)
+                    return None
+                print(f"  {symbol} {date}: checksum verified")
                 return None
-            if not _verify_checksum(zip_path, expected_checksum):
+
+            # Download ZIP file
+            if not _download_file(zip_url, zip_path):
+                print(f"  {symbol} {date}: failed to download ZIP", file=sys.stderr)
+                return None
+
+            # Verify checksum only when one was published
+            if expected_checksum is not None and not _verify_checksum(zip_path, expected_checksum):
                 print(f"  {symbol} {date}: CHECKSUM MISMATCH", file=sys.stderr)
                 return None
-            print(f"  {symbol} {date}: checksum verified")
-            return None
-
-        # Download ZIP file
-        if not _download_file(zip_url, zip_path):
-            print(f"  {symbol} {date}: failed to download ZIP", file=sys.stderr)
-            return None
-
-        # Verify checksum
-        if not _verify_checksum(zip_path, expected_checksum):
-            print(f"  {symbol} {date}: CHECKSUM MISMATCH", file=sys.stderr)
-            return None
 
         # Parse and validate
         try:
             candles, has_gaps, has_duplicates, first_ts, last_ts = _parse_archive_file(zip_path, date)
-        except (BadZipFile, ValueError, Exception) as exc:
+        except (BadZipFile, ValueError, OSError) as exc:
             print(f"  {symbol} {date}: failed to parse: {exc}", file=sys.stderr)
             return None
 
@@ -172,7 +175,7 @@ def _process_symbol_date(
             zip_path=zip_path,
             checksum_path=checksum_path,
             local_sha256=local_sha256,
-            expected_checksum=expected_checksum,
+            expected_checksum=expected_checksum or "",
             row_count=len(candles),
             first_timestamp_us=first_ts,
             last_timestamp_us=last_ts,
