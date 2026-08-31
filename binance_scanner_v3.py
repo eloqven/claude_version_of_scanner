@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+import uuid
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -27,6 +28,13 @@ from scanner_v2.fib_matrix import (
     log_summary_json,
     EventType,
     FIB_INTERVALS,
+)
+from scanner_v2.v3_checkpoint import (
+    V3CheckpointStore,
+    V3_COLLECTOR_VERSION,
+    Outcome,
+    EvaluationType,
+    archive_checksum,
 )
 from scanner_v2.indicators import IndicatorEngine
 from scanner_v2.models import (
@@ -103,92 +111,170 @@ def _compute_atr_1m(candles: List[Candle], period: int = 14) -> Decimal:
     return Decimal(str(atr))
 
 
+def _process_day(archive_source: ArchiveCandleSource, fib_matrix: FibMatrix,
+                 event_store: V3EventStore, symbol: str, date: str,
+                 bootstrap_missing: bool):
+    """Fully process one (symbol, date) unit and return its event list.
+
+    Raises ``_NoArchiveData`` when the archive has no data for the date (used to
+    mark the unit ``unavailable`` rather than ``failed``).
+    """
+    date_obj = datetime.strptime(date, "%Y-%m-%d")
+    day_start_us = int(date_obj.timestamp() * 1_000_000)
+    day_end_us = int((date_obj + timedelta(days=1)).timestamp() * 1_000_000)
+
+    print(f"Processing {date}...")
+
+    # Fetch the full day's 1s batch once and resample locally (perf fix:
+    # avoids re-fetching and re-parsing the day for every 1m evaluation).
+    batch_1s = _get_1s_batch(archive_source, symbol, day_start_us, day_end_us)
+    if batch_1s is None:
+        raise _NoArchiveData(date)
+
+    from scanner_v2.sources import resample_candles
+
+    candles_1m = list(resample_candles(batch_1s, "1m").candles)
+    resampled_by_interval: Dict[str, CandleBatch] = {}
+    for interval in FIB_INTERVALS:
+        try:
+            resampled_by_interval[interval] = resample_candles(batch_1s, interval)
+        except Exception:
+            continue
+
+    # Compute ATR for clustering scale
+    atr = _compute_atr_1m(candles_1m)
+
+    day_events: List[object] = []
+    day_evaluations = 0
+    # Evaluate on 1-minute cadence
+    for i in range(len(candles_1m)):
+        eval_time = candles_1m[i].open_time_us
+        day_evaluations += 1
+
+        # Build matrix at this timestamp
+        elements = fib_matrix.build_matrix(
+            symbol, eval_time, resampled_by_interval=resampled_by_interval)
+        if not elements:
+            continue
+
+        # Cluster into confluence zones
+        zones = fib_matrix.cluster_zones(elements, atr)
+        if not zones:
+            continue
+
+        # Detect events
+        events = fib_matrix.detect_events(zones, candles_1m, symbol)
+        for event in events:
+            event_store.record_event(event)
+            day_events.append(event)
+            print(f"  {event.event_type.value} at {datetime.fromtimestamp(event.timestamp_us / 1_000_000)}")
+            print(f"    {log_event_json(event)}")
+
+    print(f"  {len(candles_1m)} 1m candles, {day_evaluations} evaluations, {len(day_events)} events")
+    return day_evaluations, day_events
+
+
+class _NoArchiveData(Exception):
+    """Raised internally when an archive date has no 1s data available."""
+
+
 def run_v3_analysis(symbol: str, start_date: str, end_date: str,
                     archive_dir: str, archive_db: str, event_db: str,
-                    bootstrap_missing: bool = False) -> int:
-    """Run the V3 analysis for a symbol over a date range."""
+                    bootstrap_missing: bool = False,
+                    checkpoint_db: str = "v3_checkpoints.db",
+                    run_id: Optional[str] = None) -> int:
+    """Run the V3 analysis for a symbol over a date range.
+
+    When checkpointing is enabled (default), an unchanged, already-successful
+    (symbol, date) unit is skipped; a failed/unavailable date is retried; and a
+    source/version change is recorded as a separately-labelled evaluation.
+    """
     _setup_console()
 
     archive_source = ArchiveCandleSource(archive_dir, archive_db)
     fib_matrix = FibMatrix(archive_source)
     event_store = V3EventStore(event_db)
+    checkpoint = V3CheckpointStore(checkpoint_db)
 
     dates = _date_range(start_date, end_date)
     total_evaluations = 0
     all_events = []
+    skipped = 0
+    changed = 0
+    unavailable = 0
+    failed = 0
 
     print(f"Running V3 analysis for {symbol}: {start_date} to {end_date}")
     print(f"Archive dir: {archive_dir}")
     print(f"Event DB: {event_db}")
+    print(f"Checkpoint DB: {checkpoint_db} (v{V3_COLLECTOR_VERSION})")
     print()
 
     for date in dates:
-        date_obj = datetime.strptime(date, "%Y-%m-%d")
-        day_start_us = int(date_obj.timestamp() * 1_000_000)
-        day_end_us = int((date_obj + timedelta(days=1)).timestamp() * 1_000_000)
+        checksum = archive_checksum(symbol, date, archive_dir)
+        decision = checkpoint.should_process(symbol, date, checksum)
 
-        print(f"Processing {date}...")
+        if decision["action"] == "skip":
+            skipped += 1
+            print(f"V3_SKIP {date}: {decision['reason']}")
+            continue
 
-        # Fetch the full day's 1s batch once and resample locally (perf fix:
-        # avoids re-fetching and re-parsing the day for every 1m evaluation).
-        batch_1s = _get_1s_batch(archive_source, symbol, day_start_us, day_end_us)
-        if batch_1s is None:
+        if decision["action"] == "changed":
+            changed += 1
+            print(f"V3_CHANGE {date}: {decision['reason']}")
+
+        try:
+            day_evaluations, day_events = _process_day(
+                archive_source, fib_matrix, event_store, symbol, date,
+                bootstrap_missing=bootstrap_missing,
+            )
+        except _NoArchiveData:
+            unavailable += 1
+            checkpoint.record(
+                symbol, date, checksum, Outcome.UNAVAILABLE, EvaluationType.RETRY,
+                run_id=run_id,
+            )
             if bootstrap_missing:
-                print(f"  No archive data for {date}, skipping (bootstrap-missing)")
-                continue
+                print(f"  No archive data for {date}, recorded unavailable (bootstrap-missing)")
             else:
                 print(f"  WARNING: No archive data for {date}", file=sys.stderr)
-                continue
+            continue
+        except Exception as exc:  # noqa: BLE001
+            failed += 1
+            print(f"  ERROR processing {date}: {exc}", file=sys.stderr)
+            checkpoint.record(
+                symbol, date, checksum, Outcome.FAILED, EvaluationType.RETRY,
+                run_id=run_id,
+            )
+            continue
 
-        from scanner_v2.sources import resample_candles
-
-        candles_1m = list(resample_candles(batch_1s, "1m").candles)
-        resampled_by_interval: Dict[str, CandleBatch] = {}
-        for interval in FIB_INTERVALS:
-            try:
-                resampled_by_interval[interval] = resample_candles(batch_1s, interval)
-            except Exception:
-                continue
-
-        # Compute ATR for clustering scale
-        atr = _compute_atr_1m(candles_1m)
-
-        # Evaluate on 1-minute cadence
-        for i in range(len(candles_1m)):
-            eval_time = candles_1m[i].open_time_us
-            total_evaluations += 1
-
-            # Build matrix at this timestamp
-            elements = fib_matrix.build_matrix(
-                symbol, eval_time, resampled_by_interval=resampled_by_interval)
-            if not elements:
-                continue
-
-            # Cluster into confluence zones
-            zones = fib_matrix.cluster_zones(elements, atr)
-            if not zones:
-                continue
-
-            # Detect events
-            events = fib_matrix.detect_events(zones, candles_1m, symbol)
-            for event in events:
-                event_store.record_event(event)
-                all_events.append(event)
-                print(f"  {event.event_type.value} at {datetime.fromtimestamp(event.timestamp_us / 1_000_000)}")
-                print(f"    {log_event_json(event)}")
-
-        print(f"  {len(candles_1m)} 1m candles, {total_evaluations} evaluations")
+        evaluation_type = (
+            EvaluationType.CHANGED if decision["action"] == "changed"
+            else EvaluationType.FIRST
+        )
+        outcome = (
+            Outcome.CHANGED if decision["action"] == "changed"
+            else Outcome.SUCCESS
+        )
+        checkpoint.record(
+            symbol, date, checksum, outcome, evaluation_type,
+            run_id=run_id, evaluations=day_evaluations, event_count=len(day_events),
+        )
+        all_events.extend(day_events)
+        total_evaluations += day_evaluations
 
     # Log summary
     summary = log_summary_json(symbol, all_events, total_evaluations)
     print(f"\n{summary}")
 
     event_store.close()
+    checkpoint.close()
     archive_source.close()
 
     print(f"\nSummary: {total_evaluations} evaluations, {len(all_events)} events")
+    print(f"skipped={skipped} changed={changed} unavailable={unavailable} failed={failed}")
     print(f"Events stored in: {event_db}")
-    return 0
+    return 0 if failed == 0 else 1
 
 
 def main() -> int:
@@ -225,9 +311,18 @@ def main() -> int:
         "--bootstrap-missing", action="store_true",
         help="Bootstrap missing archive data by downloading it first"
     )
+    parser.add_argument(
+        "--checkpoint-db", default="v3_checkpoints.db",
+        help="SQLite checkpoint database (default: v3_checkpoints.db)"
+    )
+    parser.add_argument(
+        "--run-id", default=None,
+        help="Run identifier recorded in each checkpoint (default: auto uuid)"
+    )
 
     args = parser.parse_args()
 
+    run_id = args.run_id or str(uuid.uuid4().hex[:12])
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
 
     for symbol in symbols:
@@ -235,6 +330,8 @@ def main() -> int:
             symbol, args.start, args.end,
             args.archive_dir, args.archive_db, args.event_db,
             args.bootstrap_missing,
+            args.checkpoint_db,
+            run_id,
         )
         if result != 0:
             return result
