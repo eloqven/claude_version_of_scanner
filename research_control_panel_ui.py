@@ -16,6 +16,22 @@ def _now_hhmm() -> str:
     return datetime.now(timezone.utc).strftime("%H:%M:%SZ")
 
 
+def _safe_add(win, y: int, x: int, text: str, maxw: int, attr: int = 0) -> None:
+    """Write text defensively so a small/resized terminal never crashes."""
+    if y < 0 or x < 0:
+        return
+    try:
+        wh, ww = win.getmaxyx()
+        if y >= wh or x >= ww:
+            return
+        room = ww - x
+        if room <= 0:
+            return
+        win.addnstr(y, x, text[: min(maxw, room)], min(maxw, room), attr)
+    except Exception:
+        pass
+
+
 class _Pane:
     """Helper for writing bounded text with word-wrap prevention."""
 
@@ -28,13 +44,12 @@ class _Pane:
     def line(self, text: str = "", attr: int = 0) -> None:
         if self.row >= self.h:
             return
-        safe = text[: self.w]
-        self.win.addnstr(self.row, 0, safe, self.w, attr)
+        _safe_add(self.win, self.row, 0, text, self.w, attr)
         self.row += 1
 
     def blank(self) -> None:
         for r in range(self.row, self.h):
-            self.win.addnstr(r, 0, " " * self.w, self.w)
+            _safe_add(self.win, r, 0, " " * self.w, self.w)
 
 
 class _Panel:
@@ -63,18 +78,18 @@ class _Panel:
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
         if h < 12 or w < 60:
-            self.stdscr.addnstr(0, 0, f"Terminal too small ({w}x{h}); enlarge to >=60x12",
-                                w)
+            _safe_add(self.stdscr, 0, 0,
+                      f"Terminal too small ({w}x{h}); enlarge to >=60x12", w)
             self.stdscr.refresh()
             return
 
         # Header
         header = f" RESEARCH CONTROL PANEL  [VM]  {_now_hhmm()} UTC "
-        self.stdscr.addnstr(0, 0, header, w - 1, curses.A_REVERSE)
+        _safe_add(self.stdscr, 0, 0, header, w - 1, curses.A_REVERSE)
 
         # Menu bar
         menu = " 1:LIVE   2:V3   3:MONITOR   4:REPORT   Q:quit "
-        self.stdscr.addnstr(1, 0, menu, w - 1, curses.A_BOLD)
+        _safe_add(self.stdscr, 1, 0, menu, w - 1, curses.A_BOLD)
 
         # Content
         body_h = h - 4
@@ -95,8 +110,8 @@ class _Panel:
         content.refresh()
 
         # Status line
-        self.stdscr.addnstr(h - 2, 0, (" " + self.msg[: w - 2]) if self.msg else "", w - 1,
-                            curses.A_DIM)
+        _safe_add(self.stdscr, h - 2, 0, (" " + self.msg[: w - 2]) if self.msg else "",
+                  w - 1, curses.A_DIM)
 
         # Key hints
         if self.view == "live":
@@ -109,7 +124,7 @@ class _Panel:
             hints = " [c] capture snapshot  [r] refresh  [S] snapshots  [h] set retention(h)  "
         else:
             hints = " [r] refresh  [m] latest receipts  "
-        self.stdscr.addnstr(h - 1, 0, hints[: w - 1], w - 1)
+        _safe_add(self.stdscr, h - 1, 0, hints, w - 1)
         self.stdscr.refresh()
 
     def _service_block(self, pane: _Pane, name: str, unit: str,
