@@ -1,0 +1,16 @@
+[Unit]
+Description=Research scanner: hourly V1 then V2 live scan (research-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=andrei
+WorkingDirectory=/home/andrei/agent/projects/claude-scanner-cloud
+ExecStart=/home/andrei/agent/scripts/research-scanner-live.sh
+Restart=always
+RestartSec=5
+# Research-only: no order placement, no credentials, no trading.
+
+[Install]
+WantedBy=multi-user.target
