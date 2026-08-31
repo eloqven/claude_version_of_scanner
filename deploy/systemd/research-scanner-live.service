@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 User=andrei
 WorkingDirectory=/home/andrei/agent/projects/claude-scanner-cloud
+EnvironmentFile=-/home/andrei/agent/data/research-collectors/current/scanner/panel/overrides/live.env
 ExecStart=/home/andrei/agent/scripts/research-scanner-live.sh
 Restart=always
 RestartSec=5
