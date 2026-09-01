@@ -11,7 +11,8 @@
 set -u
 
 REPO_DIR=/home/andrei/agent/projects/claude-scanner-cloud
-RECEIPTS_DIR="${RESEARCH_SCANNER_RECEIPTS_DIR:-/home/andrei/agent/data/research-collectors/current/scanner}"
+RECEIPTS_DIR="${RESEARCH_SCANNER_RECEIPTS_DIR:-/data/scanner/receipts}"
+DATA_DIR="${RESEARCH_SCANNER_DATA_DIR:-/data/scanner}"
 SYMBOLS="${RESEARCH_SCANNER_V3_SYMBOLS:-BTCUSDT}"
 START_DATE="${RESEARCH_SCANNER_V3_START:-2026-06-01}"
 END_DATE="${RESEARCH_SCANNER_V3_END:-2026-08-31}"
@@ -24,6 +25,7 @@ while true; do
   "${PYTHON}" "${REPO_DIR}/collector_runner.py" \
     --python "${PYTHON}" \
     --receipts-dir "${RECEIPTS_DIR}" \
+    --data-dir "${DATA_DIR}" \
     v3 --symbols "${SYMBOLS}" --start "${START_DATE}" --end "${END_DATE}"
   # Non-zero only means "this pass failed"; keep the loop and retry next pass.
   sleep "${PASS_SLEEP_S}"

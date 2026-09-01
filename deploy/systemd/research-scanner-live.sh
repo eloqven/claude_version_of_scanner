@@ -10,7 +10,8 @@
 set -u
 
 REPO_DIR=/home/andrei/agent/projects/claude-scanner-cloud
-RECEIPTS_DIR="${RESEARCH_SCANNER_RECEIPTS_DIR:-/home/andrei/agent/data/research-collectors/current/scanner}"
+RECEIPTS_DIR="${RESEARCH_SCANNER_RECEIPTS_DIR:-/data/scanner/receipts}"
+DATA_DIR="${RESEARCH_SCANNER_DATA_DIR:-/data/scanner}"
 MAX_SCAN="${RESEARCH_SCANNER_MAX_SCAN:-20}"
 CAN_UPLOAD="${RESEARCH_SCANNER_CAN_UPLOAD:-false}"
 CYCLE_SLEEP_S="${RESEARCH_SCANNER_LIVE_SLEEP_S:-3600}"
@@ -27,6 +28,7 @@ while true; do
   "${PYTHON}" "${REPO_DIR}/collector_runner.py" \
     --python "${PYTHON}" \
     --receipts-dir "${RECEIPTS_DIR}" \
+    --data-dir "${DATA_DIR}" \
     live --max-scan "${MAX_SCAN}"
   # Non-zero here only means "this cycle failed"; keep the loop and retry next
   # cycle after sleeping. Exit code intentionally ignored.
