@@ -16,6 +16,7 @@ from collector_runner import (
     read_receipts,
     run_cycle,
     _acquire_lock,
+    _v1_candidate_count,
 )
 
 
@@ -125,6 +126,48 @@ class LockTests(unittest.TestCase):
             tb.join(timeout=5)
             self.assertTrue(b_acquired["ok"], "worker B should acquire after release")
             ta.join(timeout=5)
+
+
+class V1CandidateCountTests(unittest.TestCase):
+    def test_missing_db_returns_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(_v1_candidate_count(Path(tmp) / "nope.db"), 0)
+
+    def test_latest_run_n_candidates(self) -> None:
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "scanner.db"
+            conn = sqlite3.connect(str(db_path))
+            try:
+                conn.execute(
+                    "CREATE TABLE scan_runs (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    " n_candidates INTEGER)"
+                )
+                conn.execute("INSERT INTO scan_runs (n_candidates) VALUES (3)")
+                conn.execute("INSERT INTO scan_runs (n_candidates) VALUES (7)")
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertEqual(_v1_candidate_count(db_path), 7,
+                             "must reflect the latest run, not an earlier one")
+
+    def test_null_n_candidates_returns_zero(self) -> None:
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "scanner.db"
+            conn = sqlite3.connect(str(db_path))
+            try:
+                conn.execute(
+                    "CREATE TABLE scan_runs (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    " n_candidates INTEGER)"
+                )
+                conn.execute("INSERT INTO scan_runs (id, n_candidates) VALUES (1, NULL)")
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertEqual(_v1_candidate_count(db_path), 0)
 
 
 if __name__ == "__main__":

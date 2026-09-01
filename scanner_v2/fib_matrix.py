@@ -267,61 +267,75 @@ class FibMatrix:
 
     def detect_events(self, zones: List[ConfluenceZone],
                       candles: Sequence[Candle], symbol: str) -> List[V3Event]:
-        """Detect Fibonacci confluence events from zones and price action."""
+        """Detect Fibonacci confluence events from zones and price action.
+
+        For each zone the first candle that touches it is the event's causal
+        anchor (type comes only from that candle). Reaction metrics are then
+        measured post-hoc over ``candles`` (forward outcome, not predictive).
+        """
         events: List[V3Event] = []
 
         for zone in zones:
-            event = self._classify_zone_event(zone, candles, symbol)
-            if event:
-                events.append(event)
+            touch_candle = next(
+                (c for c in candles if self.touch(zone, c)), None)
+            if touch_candle is None:
+                continue
+            event = self.classify_touch_event(zone, touch_candle, symbol)
+            event = V3Event(
+                event_type=event.event_type,
+                timestamp_us=event.timestamp_us,
+                symbol=event.symbol,
+                zone=event.zone,
+                reaction_metrics=self.measure_reaction(zone, touch_candle, candles),
+                matrix_elements=event.matrix_elements,
+            )
+            events.append(event)
 
         return events
 
-    def _classify_zone_event(self, zone: ConfluenceZone,
-                            candles: Sequence[Candle],
-                            symbol: str) -> Optional[V3Event]:
-        """Classify a zone interaction as a specific event type."""
-        zone_candles = [
-            c for c in candles
-            if c.low <= zone.high and c.high >= zone.low
-        ]
+    @staticmethod
+    def touch(zone: ConfluenceZone, candle: Candle) -> bool:
+        """Whether ``candle`` overlaps the zone price band (a candle touch)."""
+        return candle.low <= zone.high and candle.high >= zone.low
 
-        if not zone_candles:
-            return None
+    @staticmethod
+    def classify_touch_event(zone: ConfluenceZone, touch_candle: Candle,
+                             symbol: str) -> V3Event:
+        """Build an event from a single (causal) touching candle.
 
-        first_touch = zone_candles[0]
-        last_touch = zone_candles[-1]
-
-        # Determine event type based on price action
-        if first_touch.low <= zone.low and first_touch.close > zone.low:
+        Uses only ``touch_candle`` to derive the event type, so no future
+        candle is consulted. Reaction metrics are intentionally left empty
+        here; callers compute them post-hoc with :meth:`measure_reaction`
+        once forward candles are available.
+        """
+        t = touch_candle
+        if t.low <= zone.low and t.close > zone.low:
             event_type = EventType.SUPPORT_REJECTION
-        elif first_touch.high >= zone.high and first_touch.close < zone.high:
+        elif t.high >= zone.high and t.close < zone.high:
             event_type = EventType.RESISTANCE_REJECTION
-        elif first_touch.close > zone.high:
+        elif t.close > zone.high:
             event_type = EventType.BREAK_UP
-        elif first_touch.close < zone.low:
+        elif t.close < zone.low:
             event_type = EventType.BREAK_DOWN
         else:
             event_type = EventType.TOUCH_ONLY
-
-        # Calculate reaction metrics
-        reaction_metrics = self._calculate_reaction_metrics(
-            zone, first_touch, candles
-        )
-
         return V3Event(
             event_type=event_type,
-            timestamp_us=first_touch.open_time_us,
+            timestamp_us=t.open_time_us,
             symbol=symbol if symbol else (zone.members[0].interval if zone.members else "UNKNOWN"),
             zone=zone,
-            reaction_metrics=reaction_metrics,
+            reaction_metrics=[],
             matrix_elements=zone.members,
         )
 
-    def _calculate_reaction_metrics(self, zone: ConfluenceZone,
-                                    touch_candle: Candle,
-                                    candles: Sequence[Candle]) -> List[ReactionMetrics]:
-        """Calculate reaction metrics for each reaction window."""
+    def measure_reaction(self, zone: ConfluenceZone, touch_candle: Candle,
+                         candles: Sequence[Candle]) -> List[ReactionMetrics]:
+        """Compute post-hoc reaction metrics over forward windows.
+
+        Forward-looking by design: this measures what actually happened after
+        a touch (the outcome), so it is applied only after detection, never to
+        influence *when* or *what type* an event is.
+        """
         metrics: List[ReactionMetrics] = []
         touch_time = touch_candle.open_time_us
 

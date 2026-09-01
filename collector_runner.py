@@ -181,17 +181,39 @@ def _count_pattern(log_text: str, pattern: str) -> int:
     return log_text.count(pattern)
 
 
+def _v1_candidate_count(db_path: Path) -> int:
+    """Latest run's n_candidates from the V1 SQLite DB, or 0 if absent."""
+    if not db_path.exists():
+        return 0
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute(
+                "SELECT n_candidates FROM scan_runs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def _run_live(max_scan: int, receipts_dir: Optional[Path],
-              python: str = "python3", run_dir: Optional[Path] = None) -> Dict[str, object]:
+              python: str = "python3", run_dir: Optional[Path] = None,
+              data_dir: Optional[Path] = None) -> Dict[str, object]:
     """Run V1 then V2 sequentially; return a single cycle result."""
     run_dir = run_dir or receipts_dir or (REPO_DIR / "results" / "live")
+    data_dir = data_dir or (REPO_DIR / "data")
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     cycle_dir = run_dir / f"cycle_{ts}"
     cycle_dir.mkdir(parents=True, exist_ok=True)
 
-    v1 = _run_command([python, "binance_scanner_v1.py", "--max-scan", str(max_scan)],
+    v1 = _run_command([python, "binance_scanner_v1.py", "--max-scan", str(max_scan),
+                       "--db", str(data_dir / "scanner.db")],
                       REPO_DIR, cycle_dir / "v1.log", timeout_s=3600)
-    v2 = _run_command([python, "binance_scanner_v2.py", "--max-scan", str(max_scan)],
+    v2 = _run_command([python, "binance_scanner_v2.py", "--max-scan", str(max_scan),
+                       "--db", str(data_dir / "scanner_v2.db")],
                       REPO_DIR, cycle_dir / "v2.log", timeout_s=3600)
 
     v1_log = ""
@@ -209,7 +231,7 @@ def _run_live(max_scan: int, receipts_dir: Optional[Path],
         "workload": "live",
         "v1": v1,
         "v2": v2,
-        "v1_v2_result_count": _count_pattern(v1_log, "V1_RESULT"),
+        "v1_v2_result_count": _v1_candidate_count(data_dir / "scanner.db"),
         "v2_v2_result_count": _count_pattern(v2_log, "V2_RESULT"),
         "cycle_dir": str(cycle_dir),
     }
@@ -219,15 +241,21 @@ def _run_live(max_scan: int, receipts_dir: Optional[Path],
 
 
 def _run_v3(symbols: str, start: str, end: str, receipts_dir: Optional[Path],
-            python: str = "python3", run_dir: Optional[Path] = None) -> Dict[str, object]:
+            python: str = "python3", run_dir: Optional[Path] = None,
+            data_dir: Optional[Path] = None) -> Dict[str, object]:
     """Run V3 for symbols over a date range; return a single run result."""
     run_dir = run_dir or receipts_dir or (REPO_DIR / "results" / "v3")
+    data_dir = data_dir or (REPO_DIR / "data")
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     cycle_dir = run_dir / f"run_{ts}"
     cycle_dir.mkdir(parents=True, exist_ok=True)
 
     cmd = [python, "binance_scanner_v3.py",
-           "--symbols", symbols, "--start", start, "--end", end]
+           "--symbols", symbols, "--start", start, "--end", end,
+           "--archive-dir", str(data_dir / "binance_1s"),
+           "--archive-db", str(data_dir / "scanner_archive.db"),
+           "--event-db", str(data_dir / "fib_matrix_v3.db"),
+           "--checkpoint-db", str(data_dir / "v3_checkpoints.db")]
     v3 = _run_command(cmd, REPO_DIR, cycle_dir / "v3.log", timeout_s=7200)
 
     v3_log = ""
@@ -290,7 +318,8 @@ def _entry_live(args: argparse.Namespace) -> int:
     lock_path = receipts_dir / "live.lock"
     receipt = run_cycle(
         "live",
-        lambda: _run_live(args.max_scan, receipts_dir, python=args.python),
+        lambda: _run_live(args.max_scan, receipts_dir, python=args.python,
+                          data_dir=Path(args.data_dir)),
         lock_path, receipt_file, max_scan=args.max_scan,
     )
     print(json.dumps(receipt, sort_keys=True, default=str))
@@ -303,7 +332,8 @@ def _entry_v3(args: argparse.Namespace) -> int:
     lock_path = receipts_dir / "v3.lock"
     receipt = run_cycle(
         "v3",
-        lambda: _run_v3(args.symbols, args.start, args.end, receipts_dir, python=args.python),
+        lambda: _run_v3(args.symbols, args.start, args.end, receipts_dir,
+                        python=args.python, data_dir=Path(args.data_dir)),
         lock_path, receipt_file, symbols=args.symbols, start=args.start, end=args.end,
     )
     print(json.dumps(receipt, sort_keys=True, default=str))
@@ -319,6 +349,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--receipts-dir",
                         default=str(REPO_DIR / "data" / "run_receipts"),
                         help="Directory for append-only receipt ledgers and locks")
+    parser.add_argument("--data-dir", default=str(REPO_DIR / "data"),
+                        help="Directory for scanner DBs and raw archive data")
     sub = parser.add_subparsers(dest="command", required=True)
 
     live = sub.add_parser("live", help="Run V1 then V2 sequentially (hourly)")

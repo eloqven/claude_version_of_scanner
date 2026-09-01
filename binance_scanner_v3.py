@@ -16,7 +16,7 @@ import uuid
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -24,6 +24,7 @@ from scanner_v2.archive import ArchiveCandleSource, ArchiveMetadataStore
 from scanner_v2.fib_matrix import (
     FibMatrix,
     V3EventStore,
+    V3Event,
     log_event_json,
     log_summary_json,
     EventType,
@@ -70,6 +71,37 @@ def _date_range(start: str, end: str) -> List[str]:
     return dates
 
 
+def _resolve_window(checkpoint: V3CheckpointStore, archive_dir: str,
+                    start: Optional[str], end: Optional[str],
+                    fallback_start: str) -> Tuple[str, str]:
+    """Resolve the scan window, watermarking from the last completed unit.
+
+    When --start is not given, it becomes the day after the latest completed
+    (SUCCESS/CHANGED) checkpoint; when --end is not given, it becomes the last
+    archive date available on disk. Explicit dates always win.
+    """
+    resolved_end = end or _latest_archive_date(archive_dir) or fallback_start
+    if start is not None:
+        return start, resolved_end
+    last = checkpoint.last_completed_date()
+    if last is None:
+        return fallback_start, resolved_end
+    return (datetime.strptime(last, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d"), resolved_end
+
+
+def _latest_archive_date(archive_dir: str) -> Optional[str]:
+    root = Path(archive_dir) / "raw" / "spot" / "daily" / "klines"
+    latest: Optional[datetime] = None
+    for path in root.glob("*/*/1s/*-1s-*.zip"):
+        try:
+            dt = datetime.strptime(path.name.split("-1s-")[1][:10], "%Y-%m-%d")
+        except (IndexError, ValueError):
+            continue
+        if latest is None or dt > latest:
+            latest = dt
+    return latest.strftime("%Y-%m-%d") if latest else None
+
+
 def _get_1s_batch(archive_source: ArchiveCandleSource, symbol: str,
                   start_us: int, end_us: int) -> Optional[CandleBatch]:
     """Fetch the raw 1s candle batch for a date range from the archive."""
@@ -111,6 +143,15 @@ def _compute_atr_1m(candles: List[Candle], period: int = 14) -> Decimal:
     return Decimal(str(atr))
 
 
+def _zone_key(zone) -> str:
+    """Stable dedup identity for a confluence zone (bucketed mid price).
+
+    Same confluence level across adjacent minutes shares a key so it is not
+    re-emitted every bar; distinct levels (clear of each other) get keys apart.
+    """
+    return str(round(float(zone.mid), 4))
+
+
 def _process_day(archive_source: ArchiveCandleSource, fib_matrix: FibMatrix,
                  event_store: V3EventStore, symbol: str, date: str,
                  bootstrap_missing: bool):
@@ -146,25 +187,39 @@ def _process_day(archive_source: ArchiveCandleSource, fib_matrix: FibMatrix,
 
     day_events: List[object] = []
     day_evaluations = 0
-    # Evaluate on 1-minute cadence
+    # Causal, duplicate-free detection: walk bars forward; a zone is emitted
+    # only when the current bar first enters it, using only data up to now.
+    # Reaction metrics are measured post-hoc (forward outcome) after detection.
+    in_zone: Dict[str, bool] = {}
     for i in range(len(candles_1m)):
-        eval_time = candles_1m[i].open_time_us
+        bar = candles_1m[i]
+        eval_time = bar.open_time_us
         day_evaluations += 1
 
-        # Build matrix at this timestamp
         elements = fib_matrix.build_matrix(
             symbol, eval_time, resampled_by_interval=resampled_by_interval)
         if not elements:
             continue
 
-        # Cluster into confluence zones
         zones = fib_matrix.cluster_zones(elements, atr)
-        if not zones:
-            continue
+        for zone in zones:
+            touches = FibMatrix.touch(zone, bar)
+            key = _zone_key(zone)
+            entered = touches and not in_zone.get(key, False)
+            in_zone[key] = touches
+            if not entered:
+                continue
 
-        # Detect events
-        events = fib_matrix.detect_events(zones, candles_1m, symbol)
-        for event in events:
+            event = FibMatrix.classify_touch_event(zone, bar, symbol)
+            event = V3Event(
+                event_type=event.event_type,
+                timestamp_us=event.timestamp_us,
+                symbol=event.symbol,
+                zone=event.zone,
+                reaction_metrics=fib_matrix.measure_reaction(
+                    zone, bar, candles_1m),
+                matrix_elements=event.matrix_elements,
+            )
             event_store.record_event(event)
             day_events.append(event)
             print(f"  {event.event_type.value} at {datetime.fromtimestamp(event.timestamp_us / 1_000_000)}")
@@ -203,6 +258,7 @@ def run_v3_analysis(symbol: str, start_date: str, end_date: str,
     changed = 0
     unavailable = 0
     failed = 0
+    completed = 0
 
     print(f"Running V3 analysis for {symbol}: {start_date} to {end_date}")
     print(f"Archive dir: {archive_dir}")
@@ -260,6 +316,7 @@ def run_v3_analysis(symbol: str, start_date: str, end_date: str,
             symbol, date, checksum, outcome, evaluation_type,
             run_id=run_id, evaluations=day_evaluations, event_count=len(day_events),
         )
+        completed += 1
         all_events.extend(day_events)
         total_evaluations += day_evaluations
 
@@ -272,9 +329,13 @@ def run_v3_analysis(symbol: str, start_date: str, end_date: str,
     archive_source.close()
 
     print(f"\nSummary: {total_evaluations} evaluations, {len(all_events)} events")
-    print(f"skipped={skipped} changed={changed} unavailable={unavailable} failed={failed}")
+    print(f"skipped={skipped} changed={changed} unavailable={unavailable} failed={failed} completed={completed}")
     print(f"Events stored in: {event_db}")
-    return 0 if failed == 0 else 1
+    if failed > 0:
+        return 1
+    if completed == 0:
+        return 2
+    return 0
 
 
 def main() -> int:
@@ -288,12 +349,12 @@ def main() -> int:
         help="Comma-separated list of symbols (e.g., BTCUSDT,EIGENUSDC)"
     )
     parser.add_argument(
-        "--start", required=True,
-        help="Start date (YYYY-MM-DD)"
+        "--start", default=None,
+        help="Start date (YYYY-MM-DD); default: day after last completed unit"
     )
     parser.add_argument(
-        "--end", required=True,
-        help="End date (YYYY-MM-DD)"
+        "--end", default=None,
+        help="End date (YYYY-MM-DD); default: last date present in the archive"
     )
     parser.add_argument(
         "--archive-dir", default="data/binance_1s",
@@ -325,9 +386,16 @@ def main() -> int:
     run_id = args.run_id or str(uuid.uuid4().hex[:12])
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
 
+    checkpoint = V3CheckpointStore(args.checkpoint_db)
+    start, end = _resolve_window(
+        checkpoint, args.archive_dir, args.start, args.end,
+        fallback_start="2026-01-01",
+    )
+    print(f"Resolved window: {start} to {end}")
+
     for symbol in symbols:
         result = run_v3_analysis(
-            symbol, args.start, args.end,
+            symbol, start, end,
             args.archive_dir, args.archive_db, args.event_db,
             args.bootstrap_missing,
             args.checkpoint_db,
@@ -335,6 +403,7 @@ def main() -> int:
         )
         if result != 0:
             return result
+    checkpoint.close()
 
     return 0
 

@@ -73,7 +73,7 @@ class V3CheckpointStore:
             "SELECT symbol, date, checksum, version, outcome, evaluation_type,"
             " run_id, processed_at_us, evaluations, event_count"
             " FROM v3_checkpoints WHERE symbol=? AND date=?"
-            " ORDER BY processed_at_us DESC",
+            " ORDER BY processed_at_us DESC, rowid DESC",
             (symbol, date),
         ).fetchall()
 
@@ -85,7 +85,7 @@ class V3CheckpointStore:
             "SELECT symbol, date, checksum, version, outcome, evaluation_type,"
             " run_id, processed_at_us, evaluations, event_count"
             " FROM v3_checkpoints WHERE symbol=? AND date=? AND outcome IN (?, ?)"
-            " ORDER BY processed_at_us DESC LIMIT 1",
+            " ORDER BY processed_at_us DESC, rowid DESC LIMIT 1",
             (symbol, date, Outcome.SUCCESS.value, Outcome.CHANGED.value),
         ).fetchone()
         return row
@@ -137,6 +137,15 @@ class V3CheckpointStore:
              evaluations, event_count),
         )
         self.connection.commit()
+
+    def last_completed_date(self) -> Optional[str]:
+        """Latest date with any completed (SUCCESS/CHANGED) unit, or None."""
+        row = self.connection.execute(
+            "SELECT date FROM v3_checkpoints WHERE outcome IN (?, ?)"
+            " ORDER BY date DESC LIMIT 1",
+            (Outcome.SUCCESS.value, Outcome.CHANGED.value),
+        ).fetchone()
+        return row[0] if row else None
 
     def close(self) -> None:
         self.connection.close()
