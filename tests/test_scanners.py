@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import binance_scanner_proto as proto
 import binance_scanner_v1 as v1
+import binance_scanner_v2 as v2
 import log_dashboard as dash
 
 
@@ -114,6 +115,10 @@ class TestConsoleEncoding(unittest.TestCase):
 
     def test_v1_reconfigures_console(self):
         data = self._simulate_cp1252(v1)
+        self.assertIn(b"TEST", data)
+
+    def test_v2_reconfigures_console(self):
+        data = self._simulate_cp1252(v2)
         self.assertIn(b"TEST", data)
 
 
@@ -1543,13 +1548,14 @@ class TestLogDashboard(unittest.TestCase):
         self.assertIn('semanticLineHtml(ln.t, ln.c)', dash.PAGE_HTML)
         self.assertIn('function parseLogName(name)', dash.PAGE_HTML)
         self.assertIn('$("nb-transcript").innerHTML = ""', dash.PAGE_HTML)
+        self.assertIn('/scan -v 2 --max-scan 3', dash.PAGE_HTML)
         self.assertNotIn("/docs", dash.PAGE_HTML)
 
     def test_quoted_scanner_path_is_unwrapped(self):
         fake_job = mock.Mock(id="job-1")
         with mock.patch.object(dash, "start_job", return_value=fake_job) as start:
             result = dash.run_notebook_command(
-                '/scan --log-file "C:\\Scan Logs\\run.log"')
+                '/scan -v 1 --log-file "C:\\Scan Logs\\run.log"')
         self.assertEqual(result, {"type": "job", "job_id": "job-1"})
         script, args, env = start.call_args.args
         self.assertEqual(script, "binance_scanner_v1.py")
@@ -1568,9 +1574,9 @@ class TestLogDashboard(unittest.TestCase):
         fake_job = mock.Mock(id="job-1")
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(dash, "start_job", return_value=fake_job) as start:
-            dash.run_notebook_command("/scan --max-scan 3", td)
+            dash.run_notebook_command("/scan -v 1 --max-scan 3", td)
             scan_call = start.call_args.args
-            dash.run_notebook_command("/proto", td)
+            dash.run_notebook_command("/scan -v p", td)
             proto_call = start.call_args.args
         self.assertEqual(scan_call[2], {"SCANNER_LOGDIR": os.path.abspath(td)})
         self.assertEqual(proto_call[2], {"SCANNER_LOGDIR": os.path.abspath(td)})
@@ -1730,6 +1736,98 @@ class TestLogDashboard(unittest.TestCase):
                                  "X-Scanner-Token": self.REQUEST_TOKEN})) as r:
                     data = json.load(r)
                 self.assertIn("unknown command", data["error"])
+            finally:
+                httpd.shutdown()
+                thread.join()
+                httpd.server_close()
+
+
+class TestV2DashboardIntegration(unittest.TestCase):
+    def test_notebook_requires_one_explicit_version(self):
+        fake_job = mock.Mock(id="job-v2")
+        with mock.patch.object(dash, "start_job", return_value=fake_job) as start:
+            result = dash.run_notebook_command("/scan --version=2 --max-scan 3", "logs")
+            self.assertEqual(result, {"type": "job", "job_id": "job-v2"})
+            script, args, env = start.call_args.args
+            self.assertEqual(script, "binance_scanner_v2.py")
+            self.assertEqual(args, ["--max-scan", "3"])
+            self.assertEqual(env["SCANNER_LOGDIR"], os.path.abspath("logs"))
+            for command in ("/scan", "/scan -v 3", "/scan -v 1 --version=2"):
+                self.assertIn("version", dash.run_notebook_command(command)["error"])
+            self.assertIn("/scan -v p", dash.run_notebook_command("/proto")["error"])
+            self.assertIn("/logs", dash.run_notebook_command("/history -v p")["content"])
+
+    def test_history_requires_and_routes_explicit_versions(self):
+        fake_job = mock.Mock(id="history-job")
+        with mock.patch.object(dash, "start_job", return_value=fake_job) as start:
+            self.assertEqual(dash.run_notebook_command("/history -v 1"),
+                             {"type": "job", "job_id": "history-job"})
+            self.assertEqual(dash.run_notebook_command("/history --version=2"),
+                             {"type": "job", "job_id": "history-job"})
+            self.assertEqual(
+                [(call.args[0], call.args[1]) for call in start.call_args_list],
+                [("binance_scanner_v1.py", ["--history"]),
+                 ("binance_scanner_v2.py", ["--history"])],
+            )
+            for command in ("/history", "/history -v 3", "/history -v 1 --version=2"):
+                self.assertIn("version", dash.run_notebook_command(command)["error"])
+            self.assertIn("/logs", dash.run_notebook_command("/history -v p")["content"])
+        self.assertEqual(start.call_count, 2)
+
+    def test_v2_result_marker_is_parsed_without_display_heuristics(self):
+        payload = {
+            "version": "v2", "rank": 1, "symbol": "TESTUSDT", "base": "TEST",
+            "quote": "USDT", "price": "10", "volume": 1000, "chg24": 1.2,
+            "signal_state": "ACTIVE", "target_source": "RESISTANCE",
+            "opportunities": 15, "wins": 2, "losses": 11, "timeouts": 2,
+            "baseline": {"hit_rate": 0.1},
+            "selected": {"hit_rate": 2 / 15},
+            "order": {"entry": "10", "take_profit": "18", "stop_trigger": "9.15",
+                      "stop_limit": "9", "quantity": "1", "rr_to_trigger": "9.4",
+                      "rr_to_limit": "8"},
+        }
+        with tempfile.TemporaryDirectory() as td:
+            name = "v2_20260811_010203.log"
+            with open(os.path.join(td, name), "w", encoding="utf-8") as fh:
+                fh.write("[2026-08-11 01:02:03] INFO V2_RESULT " + json.dumps(payload) + "\n")
+            rows, warnings = dash.extract_candidates(td, name)
+        self.assertEqual(warnings, 0)
+        self.assertEqual(rows[0]["signal_state"], "ACTIVE")
+        self.assertEqual(rows[0]["timeouts"], 2)
+        self.assertAlmostEqual(rows[0]["selected_wr"], 13.3333333333)
+
+    def test_v2_results_api_filters_and_paginates(self):
+        def payload(rank, symbol, state):
+            return {
+                "version": "v2", "rank": rank, "symbol": symbol, "base": symbol[:-4],
+                "quote": "USDT", "price": "10", "volume": 1000 + rank, "chg24": 0,
+                "signal_state": state, "target_source": "ATR_FALLBACK",
+                "opportunities": 15, "wins": 2, "losses": 11, "timeouts": 2,
+                "baseline": {"hit_rate": 0.1}, "selected": {"hit_rate": 2 / 15},
+                "order": {"entry": "10", "take_profit": "18", "stop_trigger": "9.15",
+                          "stop_limit": "9", "quantity": "1", "rr_to_trigger": "9.4",
+                          "rr_to_limit": "8"},
+            }
+        with tempfile.TemporaryDirectory() as td:
+            name = "custom-v2-results.log"
+            with open(os.path.join(td, name), "w", encoding="utf-8") as fh:
+                for rank, symbol, state in ((1, "AAAUSDT", "ACTIVE"),
+                                            (2, "BBBUSDT", "INACTIVE"),
+                                            (3, "CCCUSDT", "ACTIVE")):
+                    fh.write("V2_RESULT " + json.dumps(payload(rank, symbol, state)) + "\n")
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), dash.make_handler(td, "token"))
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base = f"http://127.0.0.1:{httpd.server_address[1]}/api/results"
+                with urllib.request.urlopen(
+                        base + "?name=" + name + "&page_size=1&signal_state=ACTIVE") as response:
+                    data = json.load(response)
+                self.assertEqual((data["version"], data["total"], data["pages"]), ("v2", 2, 2))
+                self.assertEqual(data["rows"][0]["symbol"], "AAAUSDT")
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    urllib.request.urlopen(base + "?name=" + name + "&signal_state=BAD")
+                self.assertEqual(error.exception.code, 400)
             finally:
                 httpd.shutdown()
                 thread.join()

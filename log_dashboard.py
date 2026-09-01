@@ -16,6 +16,7 @@ Endpoints:
 import argparse
 import hmac
 import json
+import math
 import os
 import re
 import secrets
@@ -110,10 +111,17 @@ def read_page(logdir: str, name: str, page: int = 1,
 
 # ── Candidate results ─────────────────────────────────────────────────────────
 
+SCANNER_VERSION_REGISTRY = {
+    "1": {"script": "binance_scanner_v1.py", "history": True, "args": True},
+    "2": {"script": "binance_scanner_v2.py", "history": True, "args": True},
+    "p": {"script": "binance_scanner_proto.py", "history": False, "args": False},
+}
+
 SORTABLE_RESULT_FIELDS = (
     "rank", "base", "pair", "price", "volume", "chg24", "atr", "atr_pct",
     "wr", "signals", "wins", "losses", "rr", "ev", "entry", "tp", "tp_pct",
-    "trig", "trig_pct", "sl", "sl_pct", "qty", "gain", "loss",
+    "trig", "trig_pct", "sl", "sl_pct", "qty", "gain", "loss", "timeouts",
+    "signal_state", "target_source", "baseline_wr", "selected_wr", "rr_trigger", "rr_limit",
 )
 
 _TS_PREFIX_RE = re.compile(r"^\[[^\]]+\]\s*")
@@ -134,7 +142,9 @@ def _parse_block(lines: list) -> dict:
         "wins": None, "losses": None, "rr": None, "ev": None,
         "entry": None, "tp": None, "tp_pct": None,
         "trig": None, "trig_pct": None, "sl": None, "sl_pct": None,
-        "qty": None, "gain": None, "loss": None,
+        "qty": None, "gain": None, "loss": None, "version": "v1",
+        "signal_state": None, "target_source": None, "timeouts": None,
+        "baseline_wr": None, "selected_wr": None, "rr_trigger": None, "rr_limit": None,
     }
     for s in lines[1:]:
         m = re.match(r"^\s*Current Price\s+([\d,]+(?:\.[\d]+)?)\s+(\S+)", s)
@@ -213,6 +223,70 @@ def _parse_block(lines: list) -> dict:
     return row
 
 
+def _v2_num(value):
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _parse_v2_result(line: str):
+    """Parse the V2 machine-readable log record; no display-text heuristics."""
+    marker = "V2_RESULT "
+    if marker not in line:
+        return None
+    try:
+        payload = json.loads(line.split(marker, 1)[1])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("version") != "v2":
+        return None
+    symbol = payload.get("symbol")
+    base = payload.get("base")
+    quote = payload.get("quote")
+    rank = payload.get("rank")
+    if (not isinstance(symbol, str) or not isinstance(base, str) or quote not in ("USDT", "USDC")
+            or type(rank) is not int or rank < 1):
+        return None
+    state = payload.get("signal_state")
+    if state not in ("ACTIVE", "INACTIVE"):
+        return None
+    selected = payload.get("selected") if isinstance(payload.get("selected"), dict) else {}
+    baseline = payload.get("baseline") if isinstance(payload.get("baseline"), dict) else {}
+    order = payload.get("order") if isinstance(payload.get("order"), dict) else {}
+    wins, losses, timeouts, opportunities = (
+        payload.get("wins"), payload.get("losses"), payload.get("timeouts"),
+        payload.get("opportunities"),
+    )
+    if not all(type(value) is int and value >= 0
+               for value in (wins, losses, timeouts, opportunities)):
+        return None
+    if opportunities != wins + losses + timeouts:
+        return None
+    selected_wr = _v2_num(selected.get("hit_rate"))
+    baseline_wr = _v2_num(baseline.get("hit_rate"))
+    rr_limit = _v2_num(order.get("rr_to_limit"))
+    return {
+        "rank": rank, "symbol": symbol, "base": base, "quote": quote,
+        "price": _v2_num(payload.get("price")), "volume": _v2_num(payload.get("volume")),
+        "chg24": _v2_num(payload.get("chg24")), "atr": _v2_num(payload.get("atr")),
+        "atr_pct": None, "wr": selected_wr * 100 if selected_wr is not None else None,
+        "signals": opportunities, "wins": wins, "losses": losses, "timeouts": timeouts,
+        "rr": rr_limit, "ev": None,
+        "entry": _v2_num(order.get("entry")), "tp": _v2_num(order.get("take_profit")),
+        "tp_pct": None, "trig": _v2_num(order.get("stop_trigger")), "trig_pct": None,
+        "sl": _v2_num(order.get("stop_limit")), "sl_pct": None,
+        "qty": _v2_num(order.get("quantity")), "gain": None, "loss": None,
+        "version": "v2", "signal_state": state,
+        "target_source": payload.get("target_source") if isinstance(payload.get("target_source"), str) else None,
+        "baseline_wr": baseline_wr * 100 if baseline_wr is not None else None,
+        "selected_wr": selected_wr * 100 if selected_wr is not None else None,
+        "rr_trigger": _v2_num(order.get("rr_to_trigger")),
+        "rr_limit": rr_limit,
+    }
+
+
 def extract_candidates(logdir: str, name: str):
     """Parse candidate blocks from a V1 or prototype scan log.
 
@@ -229,6 +303,13 @@ def extract_candidates(logdir: str, name: str):
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         for raw_line in fh:
             line = raw_line.rstrip("\r\n")
+            if "V2_RESULT " in line:
+                row = _parse_v2_result(line)
+                if row is None:
+                    warnings += 1
+                else:
+                    rows.append(row)
+                continue
             if not in_candidates:
                 if "CANDIDATES" in line:
                     in_candidates = True
@@ -249,7 +330,7 @@ def extract_candidates(logdir: str, name: str):
                     break
                 block.append(s)
     if not in_candidates:
-        return [], 0
+        return rows, warnings
     if block is not None:
         row = _parse_block(block)
         if row is None:
@@ -429,6 +510,8 @@ def notebook_status(logdir: str = NOTEBOOK_LOGDIR):
     root = os.path.dirname(os.path.abspath(__file__))
     db = os.path.join(root, "scanner.db")
     db_size = os.path.getsize(db) if os.path.isfile(db) else 0
+    v2_db = os.path.join(root, "scanner_v2.db")
+    v2_db_size = os.path.getsize(v2_db) if os.path.isfile(v2_db) else 0
     logs = list_logs(logdir)
     job = _active_job()
     running = ("`%s %s`" % (job.script, " ".join(job.args))) if job else "none"
@@ -436,11 +519,43 @@ def notebook_status(logdir: str = NOTEBOOK_LOGDIR):
         "type": "markdown",
         "content": (
             "## Notebook status\n\n"
-            "- **DB:** `scanner.db` — %d bytes\n"
+            "- **V1 DB:** `scanner.db` — %d bytes\n"
+            "- **V2 DB:** `scanner_v2.db` — %d bytes\n"
             "- **Log files:** %d in `logs/` (latest: `%s`)\n"
             "- **Running job:** %s\n"
-        ) % (db_size, len(logs), logs[0]["name"] if logs else "\u2014", running),
+        ) % (db_size, v2_db_size, len(logs), logs[0]["name"] if logs else "\u2014", running),
     }
+
+
+def _extract_version(args: list[str]):
+    """Return (version, remaining_args, error), requiring one explicit selector."""
+    values, remaining = [], []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token in ("-v", "--version"):
+            if index + 1 >= len(args):
+                return None, [], "missing scanner version; use -v 1, -v 2, or -v p"
+            values.append(args[index + 1])
+            index += 2
+            continue
+        if token.startswith("--version="):
+            value = token.split("=", 1)[1]
+            if not value:
+                return None, [], "missing scanner version; use --version=1, --version=2, or --version=p"
+            values.append(value)
+            index += 1
+            continue
+        remaining.append(token)
+        index += 1
+    if not values:
+        return None, [], "missing scanner version; use -v 1, -v 2, or -v p"
+    if len(values) != 1:
+        return None, [], "duplicate scanner version selector"
+    version = values[0].lower()
+    if version not in SCANNER_VERSION_REGISTRY:
+        return None, [], "unknown scanner version; use 1, 2, or p"
+    return version, remaining, None
 
 
 def run_notebook_command(command: str, logdir: str = NOTEBOOK_LOGDIR):
@@ -464,7 +579,7 @@ def run_notebook_command(command: str, logdir: str = NOTEBOOK_LOGDIR):
         except OSError as exc:
             return {"error": "cannot read help.md: %s" % exc}
         intro = ("**Notebook commands:** `/help` `/logs` `/status` "
-                 "`/scan [args]` `/proto` `/history` `/clear`\n\n---\n\n")
+                 "`/scan -v 1|2|p [args]` `/history -v 1|2` `/clear`\n\n---\n\n")
         return {"type": "markdown", "content": intro + content}
     if name == "clear":
         return {"type": "ok", "content": "cleared"}
@@ -479,18 +594,26 @@ def run_notebook_command(command: str, logdir: str = NOTEBOOK_LOGDIR):
     if name == "status":
         return notebook_status(logdir)
     if name == "scan":
+        version, args, error = _extract_version(args)
+        if error:
+            return {"error": error}
+        spec = SCANNER_VERSION_REGISTRY[version]
+        if not spec["args"] and args:
+            return {"error": "/scan -v p takes no scanner arguments"}
         env = {"SCANNER_LOGDIR": os.path.abspath(logdir)}
         return {"type": "job",
-                "job_id": start_job("binance_scanner_v1.py", args, env).id}
+                "job_id": start_job(spec["script"], args, env).id}
     if name == "proto":
-        if args:
-            return {"error": "/proto takes no arguments"}
-        env = {"SCANNER_LOGDIR": os.path.abspath(logdir)}
-        return {"type": "job",
-                "job_id": start_job("binance_scanner_proto.py", [], env).id}
+        return {"error": "/proto is retired; use /scan -v p"}
     if name == "history":
+        version, args, error = _extract_version(args)
+        if error:
+            return {"error": error}
+        spec = SCANNER_VERSION_REGISTRY[version]
+        if not spec["history"]:
+            return {"type": "markdown", "content": "Prototype output has no history; use `/logs`."}
         return {"type": "job",
-                "job_id": start_job("binance_scanner_v1.py", ["--history"]).id}
+                "job_id": start_job(spec["script"], ["--history", *args]).id}
     return {"error": "unknown command '/%s' \u2014 try /help" % name}
 
 
@@ -560,6 +683,10 @@ def make_handler(logdir: str = "logs", request_token: str = None):
                 if quote not in ("all", "USDT", "USDC"):
                     self._send({"error": "quote must be all, USDT or USDC"}, 400)
                     return
+                signal_state = qs.get("signal_state", ["all"])[0]
+                if signal_state not in ("all", "ACTIVE", "INACTIVE"):
+                    self._send({"error": "signal_state must be all, ACTIVE, or INACTIVE"}, 400)
+                    return
                 sort = qs.get("sort", ["rank"])[0]
                 if sort not in SORTABLE_RESULT_FIELDS:
                     self._send({"error": "invalid sort field"}, 400)
@@ -569,8 +696,11 @@ def make_handler(logdir: str = "logs", request_token: str = None):
                     self._send({"error": "direction must be asc or desc"}, 400)
                     return
                 rows, warnings = extract_candidates(logdir, name)
+                is_v2_log = any(row.get("version") == "v2" for row in rows)
                 if quote != "all":
                     rows = [r for r in rows if r["quote"] == quote]
+                if signal_state != "all":
+                    rows = [r for r in rows if r.get("signal_state") == signal_state]
                 sort_key = "symbol" if sort == "pair" else sort
                 present = [r for r in rows if r[sort_key] is not None]
                 missing = [r for r in rows if r[sort_key] is None]
@@ -587,6 +717,8 @@ def make_handler(logdir: str = "logs", request_token: str = None):
                     "total": total, "page": page, "page_size": page_size,
                     "pages": pages, "sort": sort, "direction": direction,
                     "quote": quote, "warnings": warnings,
+                    "signal_state": signal_state,
+                    "version": "v2" if is_v2_log else "v1",
                 })
             elif url.path == "/api/run":
                 qs = parse_qs(url.query)
@@ -643,7 +775,7 @@ def make_handler(logdir: str = "logs", request_token: str = None):
                     return
                 raw = self.rfile.read(length)
                 body = json.loads(raw.decode("utf-8"))
-            except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            except ValueError:
                 self._send({"error": "bad request body"}, 400)
                 return
             if not isinstance(body, dict) or not isinstance(body.get("command"), str):
@@ -895,6 +1027,11 @@ PAGE_HTML = r"""<!DOCTYPE html>
             <option value="USDT">USDT</option>
             <option value="USDC">USDC</option>
           </select>
+          <select id="signal-state-filter">
+            <option value="all" selected>All states</option>
+            <option value="ACTIVE">Active</option>
+            <option value="INACTIVE">Inactive</option>
+          </select>
           <select id="res-page-size">
             <option value="25" selected>25 / page</option>
             <option value="50">50 / page</option>
@@ -926,13 +1063,13 @@ PAGE_HTML = r"""<!DOCTYPE html>
       <span style="color:#7ee787">&#10095;</span>
       <input id="nb-input" placeholder="type a command — /help for help" autocomplete="off" spellcheck="false">
     </div>
-    <div id="nb-hint">/help &#183; /logs &#183; /status &#183; /scan [args] &#183; /proto &#183; /history &#183; /clear</div>
+    <div id="nb-hint">/help &#183; /logs &#183; /status &#183; /scan -v 1|2|p &#183; /history -v 1|2 &#183; /clear</div>
   </div>
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
 let state = { name: null, page: 1, view: "raw",
-              sort: "rank", direction: "asc", quote: "all", resPageSize: 25 };
+              sort: "rank", direction: "asc", quote: "all", signalState: "all", resPageSize: 25 };
 const POLL_MS = 800;
 
 function reloadCurrent() { (state.view === "raw" ? loadPage : loadResults)(); }
@@ -944,13 +1081,13 @@ function fmtSize(n) {
 }
 
 function parseLogName(name) {
-  const m = name.match(/^(v1|proto)_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})(?:_\d+)?\.log$/i);
+  const m = name.match(/^(v1|v2|proto)_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})(?:_\d+)?\.log$/i);
   if (!m) return null;
   const month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][Number(m[3]) - 1];
   if (!month) return null;
   return {
-    kind: m[1].toLowerCase() === "proto" ? "PROTO" : "V1",
+    kind: m[1].toLowerCase() === "proto" ? "PROTO" : m[1].toUpperCase(),
     date: month + " " + Number(m[4]) + ", " + m[2],
     time: m[5] + ":" + m[6] + ":" + m[7]
   };
@@ -1164,7 +1301,7 @@ $("page-size").addEventListener("change", () => { state.page = 1; loadPage(); })
 
 /* ---------------- results view ---------------- */
 
-const RES_COLUMNS = [
+const V1_RES_COLUMNS = [
   { key: "rank",   label: "Rank" },
   { key: "pair",   label: "Pair" },
   { key: "price",  label: "Price" },
@@ -1183,6 +1320,28 @@ const RES_COLUMNS = [
   { key: "gain",   label: "If TP hit" },
   { key: "loss",   label: "If SL hit" },
 ];
+
+const V2_RES_COLUMNS = [
+  { key: "rank",        label: "Rank" },
+  { key: "pair",        label: "Pair" },
+  { key: "signal_state", label: "State" },
+  { key: "target_source", label: "TP source" },
+  { key: "price",       label: "Best ask" },
+  { key: "volume",      label: "24h Volume" },
+  { key: "atr",         label: "ATR" },
+  { key: "baseline_wr", label: "Baseline TP" },
+  { key: "selected_wr", label: "Selected TP" },
+  { key: "signals",     label: "Opportunities" },
+  { key: "rr_trigger",  label: "R:R trigger" },
+  { key: "rr_limit",    label: "R:R limit" },
+  { key: "entry",       label: "Entry" },
+  { key: "tp",          label: "TP" },
+  { key: "trig",        label: "Stop trigger" },
+  { key: "sl",          label: "Stop limit" },
+  { key: "qty",         label: "Quantity" },
+];
+
+function resultColumns(data) { return data.version === "v2" ? V2_RES_COLUMNS : V1_RES_COLUMNS; }
 
 function fmtFloat(v, maxDec) {
   if (v === null || v === undefined) return "—";
@@ -1227,12 +1386,19 @@ function resCellHtml(r, c) {
     case "atr": return r.atr === null ? "—"
         : fmtFloat(r.atr, 8) + pctSub(r.atr_pct);
     case "wr": return r.wr === null ? "—" : percentageHtml(fmtPct(r.wr, false));
+    case "baseline_wr": return r.baseline_wr === null ? "—" : percentageHtml(fmtPct(r.baseline_wr, false));
+    case "selected_wr": return r.selected_wr === null ? "—" : percentageHtml(fmtPct(r.selected_wr, false));
+    case "signal_state": return r.signal_state === null ? "—" : esc(r.signal_state);
+    case "target_source": return r.target_source === null ? "—" : esc(r.target_source);
     case "signals": {
       if (r.signals === null) return "—";
       if (r.wins === null) return String(r.signals);
-      return r.signals + ' <span class="res-sub">W:' + r.wins + " L:" + r.losses + "</span>";
+      return r.signals + ' <span class="res-sub">W:' + r.wins + " L:" + r.losses +
+        (r.timeouts === null || r.timeouts === undefined ? "" : " TO:" + r.timeouts) + "</span>";
     }
     case "rr": return r.rr === null ? "—" : fmtFloat(r.rr, 1) + " : 1";
+    case "rr_trigger": return r.rr_trigger === null ? "—" : fmtFloat(r.rr_trigger, 2) + " : 1";
+    case "rr_limit": return r.rr_limit === null ? "—" : fmtFloat(r.rr_limit, 2) + " : 1";
     case "ev": return r.ev === null ? "—"
         : '<span class="' + (r.ev >= 0 ? "res-ev-pos" : "res-ev-neg") + '">' +
           fmtMoney(r.ev, true) + "</span>";
@@ -1253,7 +1419,8 @@ function resCellHtml(r, c) {
 function renderResultsHeader(d) {
   const head = $("res-head");
   head.innerHTML = "";
-  RES_COLUMNS.forEach((c) => {
+  const columns = resultColumns(d);
+  columns.forEach((c) => {
     const th = document.createElement("th");
     th.textContent = c.label;
     th.onclick = () => {
@@ -1268,7 +1435,7 @@ function renderResultsHeader(d) {
     head.appendChild(th);
   });
   [...head.children].forEach((th, i) => {
-    const c = RES_COLUMNS[i];
+    const c = columns[i];
     th.classList.toggle("sorted", c.key === d.sort);
     th.textContent = c.label + (c.key === d.sort
       ? (d.direction === "asc" ? " ▲" : " ▼") : "");
@@ -1280,7 +1447,7 @@ async function loadResults() {
   const url = "/api/results?name=" + encodeURIComponent(state.name) +
               "&page=" + state.page + "&page_size=" + state.resPageSize +
               "&quote=" + state.quote + "&sort=" + state.sort +
-              "&direction=" + state.direction;
+              "&direction=" + state.direction + "&signal_state=" + state.signalState;
   const r = await fetch(url);
   if (r.status === 404) {
     $("res-rows").innerHTML = '<tr><td id="empty-res">Log file not found.</td></tr>';
@@ -1299,7 +1466,7 @@ async function loadResults() {
   } else {
     d.rows.forEach((row) => {
       const tr = document.createElement("tr");
-      RES_COLUMNS.forEach((c) => {
+      resultColumns(d).forEach((c) => {
         const td = document.createElement("td");
         td.innerHTML = resCellHtml(row, c);
         tr.appendChild(td);
@@ -1334,6 +1501,7 @@ function setView(v) {
 $("view-raw").onclick = () => setView("raw");
 $("view-results").onclick = () => setView("results");
 $("quote-filter").onchange = (e) => { state.quote = e.target.value; state.page = 1; loadResults(); };
+$("signal-state-filter").onchange = (e) => { state.signalState = e.target.value; state.page = 1; loadResults(); };
 $("res-page-size").onchange = (e) => { state.resPageSize = Number(e.target.value); state.page = 1; loadResults(); };
 
 /* ---------------- notebook ---------------- */
@@ -1535,7 +1703,7 @@ $("palette").onchange = (e) => setPalette(e.target.value);
 (function boot() {
   const cell = nbCell();
   nbRender(cell, '<p style="color:#8a92a6">Notebook ready. Type <code>/help</code> to view ' +
-                 '<code>help.md</code>, or <code>/scan --max-scan 3</code> for a quick scan.</p>');
+                 '<code>help.md</code>, or <code>/scan -v 2 --max-scan 3</code> for a quick scan.</p>');
 })();
 
 loadFiles();
