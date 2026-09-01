@@ -62,6 +62,11 @@ class _Panel:
         self.last_snapshot: Optional[ctl.MonitorSnapshot] = None
         self.in_dialog: Optional[Tuple[str, str]] = None  # (prompt, buf)
         self.edits: Dict[str, str] = {}
+        # Anti-flicker state: repaint only when something actually changed.
+        self._dirty = True
+        self._h = self._w = 0
+        self._clock_min = ""
+        self._content: Optional[curses.window] = None
 
     # -- helpers ------------------------------------------------------------- #
 
@@ -74,15 +79,35 @@ class _Panel:
 
     # -- views --------------------------------------------------------------- #
 
-    def draw(self) -> None:
-        self.stdscr.erase()
+    def draw(self) -> bool:
+        """Repaint only when dirty, resized, or the header clock minute changed.
+
+        Returns True if a repaint happened. Idle timeout ticks now return
+        without repainting, which eliminates the per-tick erase/refresh blink.
+        """
         h, w = self.stdscr.getmaxyx()
+        if (h, w) != (self._h, self._w):
+            self._h, self._w = h, w
+            self._dirty = True
+            self._content = None  # force content window rebuild for new size
         if h < 12 or w < 60:
+            self.stdscr.erase()
             _safe_add(self.stdscr, 0, 0,
                       f"Terminal too small ({w}x{h}); enlarge to >=60x12", w)
             self.stdscr.refresh()
-            return
+            self._dirty = False
+            return True
+        minute = _now_hhmm()[:5]
+        if minute != self._clock_min:
+            self._clock_min = minute
+            self._dirty = True
+        if not self._dirty:
+            return False
+        self._dirty = False
+        self._paint(h, w)
+        return True
 
+    def _paint(self, h: int, w: int) -> None:
         # Header
         header = f" RESEARCH CONTROL PANEL  [VM]  {_now_hhmm()} UTC "
         _safe_add(self.stdscr, 0, 0, header, w - 1, curses.A_REVERSE)
@@ -93,9 +118,14 @@ class _Panel:
 
         # Content
         body_h = h - 4
-        content = curses.newwin(body_h, w, 2, 0)
-        content.erase()
-        pane = _Pane(content, body_h, w)
+        if self._content is None:
+            self._content = curses.newwin(body_h, w, 2, 0)
+        else:
+            ch, cw = self._content.getmaxyx()
+            if (ch, cw) != (body_h, w):
+                self._content.resize(body_h, w)
+        self._content.clear()
+        pane = _Pane(self._content, body_h, w)
         if self.in_dialog:
             self._draw_dialog(pane, body_h, w)
         elif self.view == "live":
@@ -107,11 +137,11 @@ class _Panel:
         elif self.view == "report":
             self._draw_report(pane)
         pane.blank()
-        content.refresh()
+        self._content.refresh()
 
-        # Status line
-        _safe_add(self.stdscr, h - 2, 0, (" " + self.msg[: w - 2]) if self.msg else "",
-                  w - 1, curses.A_DIM)
+        # Status line (left-padded so a shorter message erases any residue)
+        status = (" " + self.msg).ljust(w) if self.msg else " " * w
+        _safe_add(self.stdscr, h - 2, 0, status, w - 1, curses.A_DIM)
 
         # Key hints
         if self.view == "live":
@@ -124,7 +154,7 @@ class _Panel:
             hints = " [c] capture snapshot  [r] refresh  [S] snapshots  [h] set retention(h)  "
         else:
             hints = " [r] refresh  [m] latest receipts  "
-        _safe_add(self.stdscr, h - 1, 0, hints, w - 1)
+        _safe_add(self.stdscr, h - 1, 0, hints.ljust(w), w - 1)
         self.stdscr.refresh()
 
     def _service_block(self, pane: _Pane, name: str, unit: str,
@@ -377,15 +407,18 @@ def _main(stdscr) -> None:
         panel.draw()
         key = stdscr.getch()
         if key == curses.KEY_RESIZE:
+            panel._dirty = True
             continue
         if key == -1:
             continue
         try:
             panel.handle(key)
+            panel._dirty = True
         except KeyboardInterrupt:
             raise
         except Exception as exc:  # noqa: BLE001
             panel._status(f"error: {exc}")
+            panel._dirty = True
 
 
 if __name__ == "__main__":
