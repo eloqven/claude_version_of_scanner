@@ -251,11 +251,15 @@ def _run_v3(symbols: str, start: str, end: str, receipts_dir: Optional[Path],
     cycle_dir.mkdir(parents=True, exist_ok=True)
 
     cmd = [python, "binance_scanner_v3.py",
-           "--symbols", symbols, "--start", start, "--end", end,
+           "--symbols", symbols,
            "--archive-dir", str(data_dir / "binance_1s"),
            "--archive-db", str(data_dir / "scanner_archive.db"),
            "--event-db", str(data_dir / "fib_matrix_v3.db"),
            "--checkpoint-db", str(data_dir / "v3_checkpoints.db")]
+    if start:
+        cmd += ["--start", start]
+    if end:
+        cmd += ["--end", end]
     v3 = _run_command(cmd, REPO_DIR, cycle_dir / "v3.log", timeout_s=7200)
 
     v3_log = ""

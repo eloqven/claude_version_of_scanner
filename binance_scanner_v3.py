@@ -92,7 +92,7 @@ def _resolve_window(checkpoint: V3CheckpointStore, archive_dir: str,
 def _latest_archive_date(archive_dir: str) -> Optional[str]:
     root = Path(archive_dir) / "raw" / "spot" / "daily" / "klines"
     latest: Optional[datetime] = None
-    for path in root.glob("*/*/1s/*-1s-*.zip"):
+    for path in root.glob("*/1s/*-1s-*.zip"):
         try:
             dt = datetime.strptime(path.name.split("-1s-")[1][:10], "%Y-%m-%d")
         except (IndexError, ValueError):
@@ -333,8 +333,13 @@ def run_v3_analysis(symbol: str, start_date: str, end_date: str,
     print(f"Events stored in: {event_db}")
     if failed > 0:
         return 1
-    if completed == 0:
+    attempted = changed + unavailable + failed + completed
+    if completed == 0 and attempted > 0:
+        # New dates were available to process but none completed (all
+        # unavailable/failed): the window moved but no work succeeded.
         return 2
+    # Either real work completed, or every eligible date in the window was
+    # already checkpointed (no-op) - both are a clean pass.
     return 0
 
 
