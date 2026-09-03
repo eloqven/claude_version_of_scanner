@@ -10,5 +10,6 @@ data/binance_1s/
 scanner_archive.db
 fib_matrix_v3.db
 results/
+.venv/
 
 
