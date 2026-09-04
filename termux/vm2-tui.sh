@@ -25,30 +25,49 @@ OPENCODE_BIN="~/.opencode/bin/opencode"
 mkdir -p "$HOME/.ssh"
 chmod 700 "$HOME/.ssh"
 
-# Determine the SSH key to use. If it does not exist yet, offer to create it.
+# Pick an existing private key: skip .pub/known_hosts/config, prefer ed25519.
+find_key() {
+    local candidate
+    for candidate in "$HOME"/.ssh/id_ed25519 "$HOME"/.ssh/id_rsa "$HOME"/.ssh/*; do
+        [ -f "$candidate" ] || continue
+        case "$(basename "$candidate")" in
+            *.pub|known_hosts|config|authorized_keys) continue ;;
+        esac
+        SSH_KEY="$candidate"
+        return 0
+    done
+    return 1
+}
+
+# Determine the SSH key to use: configured default, then discovered, else generate.
 ensure_key() {
     if [ ! -f "$SSH_KEY" ]; then
-        echo "No phone SSH key found at: $SSH_KEY"
-        echo "This will create a NEW keypair for the phone and print its public key."
-        echo "You must copy that public key into VM2's ~/.ssh/authorized_keys"
-        echo "so the phone can log in. It will NOT reuse the desktop secret."
-        read -r -p "Generate now? (y/N) " ans
-        case "$ans" in
-            y|Y|yes|YES)
-                ssh-keygen -t ed25519 -f "$SSH_KEY" -N "" -C "termux-vm2-phone" >/dev/null
-                echo ""
-                echo "Public key (append to VM2 ~/.ssh/authorized_keys):"
-                cat "$SSH_KEY.pub"
-                echo ""
-                echo "Verify SSH login to VM2 after adding it, then re-run this menu."
-                read -r -p "Press Enter to continue..."
-                exit 0
-                ;;
-            *)
-                echo "No key -> cannot connect. Exiting."
-                exit 1
-                ;;
-        esac
+        if find_key; then
+            echo "Using existing phone key: $SSH_KEY"
+            echo "(If this is not the key authorized on VM2, edit SSH_KEY at the top of this script.)"
+        else
+            echo "No phone SSH key found under ~/.ssh/."
+            echo "This will create a NEW keypair for the phone and print its public key."
+            echo "You must copy that public key into VM2's ~/.ssh/authorized_keys"
+            echo "so the phone can log in. It will NOT reuse the desktop secret."
+            read -r -p "Generate now? (y/N) " ans
+            case "$ans" in
+                y|Y|yes|YES)
+                    ssh-keygen -t ed25519 -f "$SSH_KEY" -N "" -C "termux-phone" >/dev/null
+                    echo ""
+                    echo "Public key (append to VM2 ~/.ssh/authorized_keys):"
+                    cat "$SSH_KEY.pub"
+                    echo ""
+                    echo "Verify SSH login to VM2 after adding it, then re-run this menu."
+                    read -r -p "Press Enter to continue..."
+                    exit 0
+                    ;;
+                *)
+                    echo "No key -> cannot connect. Exiting."
+                    exit 1
+                    ;;
+            esac
+        fi
     fi
 }
 
